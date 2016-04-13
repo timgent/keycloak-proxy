@@ -35,19 +35,23 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+//
 // keycloakProxy is the server component
+//
 type keycloakProxy struct {
+	Store
+	// the proxy configuration
 	config *Config
 	// the gin service
 	router *gin.Engine
-	// the oidc provider config
-	openIDConfig oidc.ClientConfig
 	// the oidc client
-	openIDClient *oidc.Client
+	client *oidc.Client
 	// the proxy client
-	proxy reverseProxy
-	// the upstream endpoint
-	upstreamURL *url.URL
+	upstream reverseProxy
+	// the upstream endpoint url
+	endpoint *url.URL
+	// the store interface
+	store Store
 }
 
 type reverseProxy interface {
@@ -59,8 +63,14 @@ func init() {
 	time.LoadLocation("UTC")
 }
 
+//
 // newKeycloakProxy create's a new keycloak proxy from configuration
+//
 func newKeycloakProxy(cfg *Config) (*keycloakProxy, error) {
+	var err error
+
+	log.Infof("starting %s, version: %s, author: %s", prog, version, author)
+
 	// step: set the logging level
 	if cfg.LogJSONFormat {
 		log.SetFormatter(&log.JSONFormatter{})
@@ -69,38 +79,36 @@ func newKeycloakProxy(cfg *Config) (*keycloakProxy, error) {
 		log.SetLevel(log.DebugLevel)
 	}
 
-	log.Infof("starting %s, version: %s, author: %s", prog, version, author)
-
+	// step: create a proxy service
+	service := &keycloakProxy{config: cfg}
 	// step: parse the upstream endpoint
-	upstreamURL, err := url.Parse(cfg.Upstream)
+	service.endpoint, err = url.Parse(cfg.Upstream)
 	if err != nil {
 		return nil, err
 	}
-
-	// step: create a proxy service
-	service := &keycloakProxy{
-		config:      cfg,
-		upstreamURL: upstreamURL,
+	// step: initialize the store if any
+	if cfg.RefreshSessions && cfg.StoreURL != "" {
+		if service.store, err = newStore(cfg.StoreURL); err != nil {
+			return nil, err
+		}
 	}
 
 	// step: initialize the reverse http proxy
-	reverse, err := service.initializeReverseProxy(upstreamURL)
+	service.upstream, err = service.setupReverseProxy(cfg.Upstream)
 	if err != nil {
 		return nil, err
 	}
-	service.proxy = reverse
 
 	// step: initialize the openid client
 	if cfg.SkipTokenVerification {
 		log.Infof("TESTING ONLY CONFIG - the verification of the token have been disabled")
 
 	} else {
-		client, clientCfg, err := initializeOpenID(cfg.DiscoveryURL, cfg.ClientID, cfg.Secret, cfg.RedirectionURL, cfg.Scopes)
+		client, _, err := initializeOpenID(cfg.DiscoveryURL, cfg.ClientID, cfg.Secret, cfg.RedirectionURL, cfg.Scopes)
 		if err != nil {
 			return nil, err
 		}
-		service.openIDConfig = clientCfg
-		service.openIDClient = client
+		service.client = client
 	}
 
 	// step: initialize the gin router
@@ -108,7 +116,14 @@ func newKeycloakProxy(cfg *Config) (*keycloakProxy, error) {
 	service.router = router
 
 	// step: load the templates
-	service.initializeTemplates()
+	if err = service.setupTemplates(); err != nil {
+		return nil, err
+	}
+
+	if err := service.setupRouter(); err != nil {
+		return nil, err
+	}
+
 	for _, resource := range cfg.Resources {
 		log.Infof("protecting resources under uri: %s", resource)
 	}
@@ -116,54 +131,15 @@ func newKeycloakProxy(cfg *Config) (*keycloakProxy, error) {
 		log.Infof("the token must container the claim: %s, required: %s", name, value)
 	}
 
-	service.initializeRouter()
+
+
 
 	return service, nil
 }
 
-// initializeRouter sets up the gin routing
-func (r keycloakProxy) initializeRouter() {
-	r.router.Use(gin.Recovery())
-	// step: are we logging the traffic?
-	if r.config.LogRequests {
-		r.router.Use(r.loggingHandler())
-	}
-	// step: enabling the security filter?
-	if r.config.EnableSecurityFilter {
-		log.Infof("enabling the security handler")
-		r.router.Use(r.securityHandler())
-	}
-
-	// step: add the routing
-	r.router.GET(authorizationURL, r.oauthAuthorizationHandler)
-	r.router.GET(callbackURL, r.oauthCallbackHandler)
-	r.router.GET(healthURL, r.healthHandler)
-	r.router.GET(tokenURL, r.tokenHandler)
-	r.router.GET(expiredURL, r.expirationHandler)
-
-	r.router.Use(r.entryPointHandler(), r.authenticationHandler(), r.admissionHandler())
-}
-
-// initializeTemplates loads the custom template
-func (r *keycloakProxy) initializeTemplates() {
-	var list []string
-
-	if r.config.SignInPage != "" {
-		log.Debugf("loading the custom sign in page: %s", r.config.SignInPage)
-		list = append(list, r.config.SignInPage)
-	}
-	if r.config.ForbiddenPage != "" {
-		log.Debugf("loading the custom sign forbidden page: %s", r.config.ForbiddenPage)
-		list = append(list, r.config.ForbiddenPage)
-	}
-
-	if len(list) > 0 {
-		log.Infof("loading the custom templates: %s", strings.Join(list, ","))
-		r.router.LoadHTMLFiles(list...)
-	}
-}
-
+//
 // Run starts the proxy service
+//
 func (r *keycloakProxy) Run() error {
 	tlsConfig := &tls.Config{}
 
@@ -204,7 +180,54 @@ func (r *keycloakProxy) Run() error {
 	return nil
 }
 
+//
+// setupRouter sets up the gin routing
+//
+func (r keycloakProxy) setupRouter() error {
+	r.router.Use(gin.Recovery())
+	// step: are we logging the traffic?
+	if r.config.LogRequests {
+		r.router.Use(r.loggingHandler())
+	}
+	// step: enabling the security filter?
+	if r.config.EnableSecurityFilter {
+		r.router.Use(r.securityHandler())
+	}
+	// step: add the routing
+	r.router.GET(authorizationURL, r.oauthAuthorizationHandler)
+	r.router.GET(callbackURL, r.oauthCallbackHandler)
+	r.router.GET(healthURL, r.healthHandler)
+	r.router.GET(tokenURL, r.tokenHandler)
+	r.router.GET(expiredURL, r.expirationHandler)
+	r.router.Use(r.entryPointHandler(), r.authenticationHandler(), r.admissionHandler())
+
+	return nil
+}
+
+//
+// setupTemplates loads the custom template
+//
+func (r *keycloakProxy) setupTemplates() {
+	var list []string
+
+	if r.config.SignInPage != "" {
+		log.Debugf("loading the custom sign in page: %s", r.config.SignInPage)
+		list = append(list, r.config.SignInPage)
+	}
+	if r.config.ForbiddenPage != "" {
+		log.Debugf("loading the custom sign forbidden page: %s", r.config.ForbiddenPage)
+		list = append(list, r.config.ForbiddenPage)
+	}
+
+	if len(list) > 0 {
+		log.Infof("loading the custom templates: %s", strings.Join(list, ","))
+		r.router.LoadHTMLFiles(list...)
+	}
+}
+
+//
 // redirectToURL redirects the user and aborts the context
+//
 func (r keycloakProxy) redirectToURL(url string, cx *gin.Context) {
 	// step: add the cors headers
 	r.injectCORSHeaders(cx)
@@ -213,7 +236,9 @@ func (r keycloakProxy) redirectToURL(url string, cx *gin.Context) {
 	cx.Abort()
 }
 
+//
 // accessForbidden redirects the user to the forbidden page
+//
 func (r keycloakProxy) accessForbidden(cx *gin.Context) {
 	// step: do we have a custom forbidden page
 	if r.config.hasForbiddenPage() {
@@ -225,7 +250,9 @@ func (r keycloakProxy) accessForbidden(cx *gin.Context) {
 	cx.AbortWithStatus(http.StatusForbidden)
 }
 
+//
 // redirectToAuthorization redirects the user to authorization handler
+//
 func (r keycloakProxy) redirectToAuthorization(cx *gin.Context) {
 	// step: are we handling redirects?
 	if r.config.NoRedirects {
@@ -246,7 +273,9 @@ func (r keycloakProxy) redirectToAuthorization(cx *gin.Context) {
 	r.redirectToURL(authorizationURL+authQuery, cx)
 }
 
+//
 // injectCORSHeaders adds the cors access controls to the oauth responses
+//
 func (r *keycloakProxy) injectCORSHeaders(cx *gin.Context) {
 	c := r.config.CORS
 	if len(c.Origins) > 0 {
@@ -269,24 +298,12 @@ func (r *keycloakProxy) injectCORSHeaders(cx *gin.Context) {
 	}
 }
 
-func (r *keycloakProxy) addAuthenticationHeader(cx *gin.Context, errorCode, errorMessage string) {
-	// step: inject the error message
-	header := "Bearer realm=\"secure\""
-	if errorCode != "" {
-		header += fmt.Sprintf(",error=\"%s\"", errorCode)
-	}
-	if errorMessage != "" {
-		header += fmt.Sprintf(", error_description=\"%s\"", errorMessage)
-	}
-
-	// step: add the www-authenticate header
-	cx.Writer.Header().Set("WWW-Authenticate", header)
-}
-
+//
 // tryUpdateConnection attempt to upgrade the connection to a http pdy stream
+//
 func (r *keycloakProxy) tryUpdateConnection(cx *gin.Context) error {
 	// step: dial the endpoint
-	tlsConn, err := tryDialEndpoint(r.upstreamURL)
+	tlsConn, err := tryDialEndpoint(r.endpoint)
 	if err != nil {
 		return err
 	}
@@ -314,10 +331,11 @@ func (r *keycloakProxy) tryUpdateConnection(cx *gin.Context) error {
 	return nil
 }
 
-// initializeReverseProxy create a reverse http proxy from the upstream
-func (r *keycloakProxy) initializeReverseProxy(upstream *url.URL) (reverseProxy, error) {
+//
+// setupReverseProxy create a reverse http proxy from the upstream
+//
+func (r *keycloakProxy) setupReverseProxy(upstream *url.URL) (reverseProxy, error) {
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
-
 	// step: we don't care about the cert verification here
 	proxy.Transport = &http.Transport{
 		Dial: (&net.Dialer{
@@ -332,4 +350,32 @@ func (r *keycloakProxy) initializeReverseProxy(upstream *url.URL) (reverseProxy,
 	}
 
 	return proxy, nil
+}
+
+// Add the token to the store
+func (r keycloakProxy) Set(key string, value string) error {
+	// step: encrpyt the value
+
+
+
+
+	return nil
+}
+
+// Get retrieves a token from the store
+func (r keycloakProxy) Get(key string) (string, error) {
+	// step: the key is the access token
+
+
+	return "", nil
+}
+
+// Delete removes a key from the store
+func (r keycloakProxy) Delete(string) error {
+	return nil
+}
+
+// Close is used to close off any resources
+func (r keycloakProxy) Close() error {
+	return nil
 }

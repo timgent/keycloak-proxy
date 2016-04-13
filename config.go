@@ -94,6 +94,11 @@ func (r *Config) isValid() error {
 		if r.EncryptionKey != "" && len(r.EncryptionKey) < 32 {
 			return fmt.Errorf("the encryption key is too short, must be longer than 32 characters")
 		}
+		if r.StoreURL != "" {
+			if _, err := url.Parse(r.StoreURL); err != nil {
+				return fmt.Errorf("the store url is invalid, error: %s", err)
+			}
+		}
 		if r.MaxSession == 0 && r.RefreshSessions {
 			r.MaxSession = time.Duration(6) * time.Hour
 		}
@@ -161,6 +166,9 @@ func readOptions(cx *cli.Context, config *Config) (err error) {
 	}
 	if cx.IsSet("encryption-key") {
 		config.EncryptionKey = cx.String("encryption-key")
+	}
+	if cx.IsSet("store-url") {
+		config.StoreURL = cx.String("store-url")
 	}
 	if cx.IsSet("no-redirects") {
 		config.NoRedirects = cx.Bool("no-redirects")
@@ -315,6 +323,10 @@ func getOptions() []cli.Flag {
 		cli.StringFlag{
 			Name:  "encryption-key",
 			Usage: "the encryption key used to encrpytion the session state",
+		},
+		cli.StringFlag{
+			Name:  "store-url",
+			Usage: "the store url to use for storing the refresh tokens, i.e. redis://127.0.0.1:6379, file:///etc/tokens.file",
 		},
 		cli.BoolFlag{
 			Name:  "no-redirects",

@@ -38,7 +38,7 @@ const (
 	fakeTestAdminRolesURL  = "/test_admin_roles"
 	fakeAuthAllURL         = "/auth_all"
 	fakeTestWhitelistedURL = fakeAuthAllURL + "/white_listed"
-	faketestListenOrdered  = fakeAuthAllURL + "/bad_order"
+	fakeTestListenOrdered  = fakeAuthAllURL + "/bad_order"
 
 	fakeAdminRole = "role:admin"
 	fakeTestRole  = "role:test"

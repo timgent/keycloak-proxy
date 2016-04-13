@@ -147,4 +147,28 @@ type Config struct {
 	Verbose bool `json:"verbose" yaml:"verbose"`
 	// Hostname is a list of hostname's the service should response to
 	Hostnames []string `json:"hostnames" yaml:"hostnames"`
+	// Store is a url for a store resource, used to hold the refresh tokens
+	StoreURL string `json:"store-url" yaml:"store-url"`
 }
+
+// Store is used to hold the offline refresh token, assuming you don't want to use
+// the default practice of a encrypted cookie
+type Store interface {
+	// Add the token to the store
+	Set(string, string) error
+	// Get retrieves a token from the store
+	Get(string) (string, error)
+	// Delete removes a key from the store
+	Delete(string) error
+	// Close is used to close off any resources
+	Close() error
+}
+
+// refreshState holds the state related data
+type refreshState struct {
+	// the max time the session is permitted
+	expireOn time.Time
+	// the refresh token
+	refreshToken string
+}
+

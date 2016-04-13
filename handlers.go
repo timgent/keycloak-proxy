@@ -24,9 +24,7 @@ import (
 	"time"
 
 	log "github.com/Sirupsen/logrus"
-	"github.com/coreos/go-oidc/jose"
 	"github.com/coreos/go-oidc/oauth2"
-	"github.com/coreos/go-oidc/oidc"
 	"github.com/gin-gonic/gin"
 	"github.com/unrolled/secure"
 )
@@ -146,51 +144,44 @@ func (r *keycloakProxy) entryPointHandler() gin.HandlerFunc {
 //
 func (r *keycloakProxy) authenticationHandler() gin.HandlerFunc {
 	return func(cx *gin.Context) {
-		var session jose.JWT
-
 		// step: is authentication required on this uri?
 		if _, found := cx.Get(cxEnforce); !found {
 			log.Debugf("skipping the authentication handler, resource not protected")
 			cx.Next()
-
 			return
 		}
 
-		// step: retrieve the access token from the request
-		session, isBearer, err := r.getSessionToken(cx)
+		user, err := getIdentity(cx)
 		if err != nil {
-			// step: there isn't a session cookie, do we have refresh session cookie?
-			if err == ErrSessionNotFound && r.config.RefreshSessions && !isBearer {
-				session, err = r.refreshUserSessionToken(cx)
+			// choice: if no access token but refresh tokens is set, attempt to refresh access token
+			if err == ErrSessionNotFound && !r.config.RefreshSessions {
+				user, err = r.refreshIdentity(cx)
 				if err != nil {
-					log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed to refresh the access token")
+					log.WithFields(log.Fields{
+						"error": err.Error(),
+					}).Errorf("failed to refresh the access token")
+
 					r.redirectToAuthorization(cx)
 					return
 				}
 			} else {
-				log.Errorf("failed to get session, redirecting for authorization, %s", err)
+				log.WithFields(log.Fields{
+					"error": err.Error(),
+				}).Errorf("failed to get session, redirecting for authorization")
+
 				r.redirectToAuthorization(cx)
 				return
 			}
 		}
-
-		// step: retrieve the identity and inject in the context
-		userContext, err := r.getUserContext(session)
-		if err != nil {
-			log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed to retrieve the identity from the token")
-			r.redirectToAuthorization(cx)
-			return
-		}
-		userContext.bearerToken = isBearer
-
-		log.Debugf("found user context: %s", userContext)
+		// step: inject the user into the context
+		cx.Set(userContextName, user)
 
 		// step: check the audience for the token is us
-		if !userContext.isAudience(r.config.ClientID) {
+		if !user.isAudience(r.config.ClientID) {
 			log.WithFields(log.Fields{
-				"username":   userContext.name,
-				"expired_on": userContext.expiresAt.String(),
-				"issued":     userContext.audience,
+				"username":   user.name,
+				"expired_on": user.expiresAt.String(),
+				"issued":     user.audience,
 				"clientid":   r.config.ClientID,
 			}).Warnf("the access token audience is not us, redirecting back for authentication")
 
@@ -198,15 +189,13 @@ func (r *keycloakProxy) authenticationHandler() gin.HandlerFunc {
 			return
 		}
 
-		cx.Set(userContextName, userContext)
-
 		// step: verify the access token
 		if r.config.SkipTokenVerification {
 			log.Warnf("token verification enabled, skipping verification process - FOR TESTING ONLY")
-			if userContext.isExpired() {
+			if user.isExpired() {
 				log.WithFields(log.Fields{
-					"username":   userContext.name,
-					"expired_on": userContext.expiresAt.String(),
+					"username":   user.name,
+					"expired_on": user.expiresAt.String(),
 				}).Errorf("the session has expired and verification switch off")
 
 				r.redirectToAuthorization(cx)
@@ -215,10 +204,11 @@ func (r *keycloakProxy) authenticationHandler() gin.HandlerFunc {
 			return
 		}
 
-		if err := r.verifyToken(userContext.token); err != nil {
+		// step: verify the access token
+		if err := r.verifyToken(user.token); err != nil {
 			fields := log.Fields{
-				"username":   userContext.name,
-				"expired_on": userContext.expiresAt.String(),
+				"username":   user.name,
+				"expired_on": user.expiresAt.String(),
 				"error":      err.Error(),
 			}
 
@@ -229,26 +219,26 @@ func (r *keycloakProxy) authenticationHandler() gin.HandlerFunc {
 				r.accessForbidden(cx)
 				return
 			}
-
-			if isBearer {
+			if user.isBearerToken() {
 				log.WithFields(fields).Errorf("the session has expired and we are using bearer token")
 				r.redirectToAuthorization(cx)
 				return
 			}
-
 			// step: are we refreshing the access tokens?
 			if !r.config.RefreshSessions {
 				log.WithFields(fields).Errorf("the session has expired and token refreshing is disabled")
 				r.redirectToAuthorization(cx)
 				return
 			}
-
 			// step: attempt to refresh the access token
-			if _, err := r.refreshUserSessionToken(cx); err != nil {
+			user, err := r.refreshIdentity(cx)
+			if err != nil {
 				log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed to refresh the access token")
 				r.redirectToAuthorization(cx)
 				return
 			}
+			// step: inject the user into the context
+			cx.Set(userContextName, user)
 		}
 
 		cx.Next()
@@ -297,13 +287,11 @@ func (r *keycloakProxy) admissionHandler() gin.HandlerFunc {
 					"resource": resource.URL,
 					"required": resource.getRoles(),
 				}).Warnf("access denied, invalid roles")
-
 				r.accessForbidden(cx)
 
 				return
 			}
 		}
-
 		// step: if we have any claim matching, validate the tokens has the claims
 		for claimName, match := range claimMatches {
 			// step: if the claim is NOT in the token, we access deny
@@ -356,7 +344,6 @@ func (r *keycloakProxy) admissionHandler() gin.HandlerFunc {
 			"username": identity.name,
 			"resource": resource.URL,
 			"expires":  identity.expiresAt.Sub(time.Now()).String(),
-			"bearer":   identity.bearerToken,
 		}).Debugf("resource access permitted: %s", cx.Request.RequestURI)
 	}
 }
@@ -405,7 +392,7 @@ func (r *keycloakProxy) proxyHandler(cx *gin.Context) {
 		return
 	}
 
-	r.proxy.ServeHTTP(cx.Writer, cx.Request)
+	r.upstream.ServeHTTP(cx.Writer, cx.Request)
 }
 
 // ---
@@ -421,17 +408,17 @@ func (r *keycloakProxy) oauthAuthorizationHandler(cx *gin.Context) {
 		r.accessForbidden(cx)
 		return
 	}
-
 	// step: grab the oauth client
-	oac, err := r.openIDClient.OAuthClient()
+	oac, err := r.client.OAuthClient()
 	if err != nil {
-		log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed to retrieve the oauth client")
+		log.WithFields(log.Fields{
+			"error": err.Error(),
+		}).Errorf("failed to retrieve the oauth client")
 		cx.AbortWithStatus(http.StatusInternalServerError)
-
 		return
 	}
 
-	// step: set the grant type of the session
+	// step: set the access type of the session
 	accessType := ""
 	if r.config.RefreshSessions {
 		accessType = "offline"
@@ -457,8 +444,7 @@ func (r *keycloakProxy) oauthAuthorizationHandler(cx *gin.Context) {
 		cx.HTML(http.StatusOK, path.Base(r.config.SignInPage), model)
 		return
 	}
-
-	// step: get the redirection url
+	// step: send a redirect to the client
 	r.redirectToURL(redirectionURL, cx)
 }
 
@@ -466,24 +452,22 @@ func (r *keycloakProxy) oauthAuthorizationHandler(cx *gin.Context) {
 // oauthCallbackHandler is responsible for handling the response from keycloak
 //
 func (r *keycloakProxy) oauthCallbackHandler(cx *gin.Context) {
+	// step: get the code and state
+	code  := cx.Request.URL.Query().Get("code")
+	state := cx.Request.URL.Query().Get("state")
+
 	// step: is token verification switched on?
 	if r.config.SkipTokenVerification {
 		r.accessForbidden(cx)
 		return
 	}
-
-	// step: get the code and state
-	code := cx.Request.URL.Query().Get("code")
-	state := cx.Request.URL.Query().Get("state")
-
 	// step: ensure we have a authorization code to exchange
 	if code == "" {
 		log.WithFields(log.Fields{"client_ip": cx.ClientIP()}).Error("code parameter missing in callback")
-
 		r.accessForbidden(cx)
+
 		return
 	}
-
 	// step: ensure we have a state or default to root /
 	if state == "" {
 		state = "/"
@@ -498,7 +482,7 @@ func (r *keycloakProxy) oauthCallbackHandler(cx *gin.Context) {
 	}
 
 	// step: parse decode the identity token
-	token, identity, err := r.parseToken(response.IDToken)
+	token, identity, err := parseToken(response.IDToken)
 	if err != nil {
 		log.WithFields(log.Fields{"error": err.Error()}).Errorf("unable to parse id token for identity")
 		r.accessForbidden(cx)
@@ -512,7 +496,7 @@ func (r *keycloakProxy) oauthCallbackHandler(cx *gin.Context) {
 	}
 
 	// step: attempt to decode the access token?
-	ac, id, err := r.parseToken(response.AccessToken)
+	ac, id, err := parseToken(response.AccessToken)
 	if err != nil {
 		log.WithFields(log.Fields{"error": err.Error()}).Errorf("unable to parse the access token, using id token only")
 	} else {
@@ -536,14 +520,14 @@ func (r *keycloakProxy) oauthCallbackHandler(cx *gin.Context) {
 	// step: are we using refresh tokens?
 	if r.config.RefreshSessions {
 		// step: create the state session
-		state := &sessionState{
+		state := &refreshState{
 			refreshToken: response.RefreshToken,
 			expireOn:     time.Now().Add(r.config.MaxSession),
 		}
 
 		// step: can we parse and extract the refresh token from the response
 		// - note, the refresh token can be custom, i.e. doesn't have to be a jwt i.e. google for example
-		_, refreshToken, err := r.parseToken(response.RefreshToken)
+		_, refreshToken, err := parseToken(response.RefreshToken)
 		if err != nil {
 			log.WithFields(log.Fields{
 				"error": err.Error(),
@@ -585,35 +569,18 @@ func (r *keycloakProxy) oauthCallbackHandler(cx *gin.Context) {
 //
 func (r *keycloakProxy) expirationHandler(cx *gin.Context) {
 	// step: get the access token from the request
-	token, err := r.getSession(cx)
+	user, err := getIdentity(cx)
 	if err != nil {
-		if err == ErrSessionNotFound {
-			cx.AbortWithError(http.StatusUnauthorized, err)
-			return
-		}
-		cx.AbortWithError(http.StatusInternalServerError, err)
+		cx.AbortWithError(http.StatusUnauthorized, err)
+		return
+	}
+	// step: check the access is not expired
+	if user.isExpired() {
+		cx.AbortWithError(http.StatusUnauthorized, err)
 		return
 	}
 
-	// step: decode the claims from the tokens
-	claims, err := token.Claims()
-	if err != nil {
-		cx.AbortWithError(http.StatusInternalServerError, fmt.Errorf("unable to extract the claims"))
-		return
-	}
-	// step: extract the identity
-	identity, err := oidc.IdentityFromClaims(claims)
-	if err != nil {
-		cx.AbortWithError(http.StatusInternalServerError, fmt.Errorf("unable to extract identity"))
-		return
-	}
-
-	// step: check if token expired
-	if time.Now().After(identity.ExpiresAt) {
-		cx.AbortWithStatus(http.StatusForbidden)
-	} else {
-		cx.AbortWithStatus(http.StatusOK)
-	}
+	cx.AbortWithStatus(http.StatusOK)
 }
 
 //
@@ -621,19 +588,14 @@ func (r *keycloakProxy) expirationHandler(cx *gin.Context) {
 //
 func (r *keycloakProxy) tokenHandler(cx *gin.Context) {
 	// step: extract the access token from the request
-	token, err := r.getSession(cx)
+	user, err := getIdentity(cx)
 	if err != nil {
-		if err == ErrSessionNotFound {
-			cx.AbortWithError(http.StatusOK, err)
-			return
-		}
-		cx.AbortWithError(http.StatusInternalServerError, fmt.Errorf("unable to retrieve session, error: %s", err))
+		cx.AbortWithError(http.StatusBadRequest, fmt.Errorf("unable to retrieve session, error: %s", err))
 		return
 	}
-
 	// step: write the json content
 	cx.Writer.Header().Set("Content-Type", "application/json")
-	cx.String(http.StatusOK, fmt.Sprintf("%s", token.Payload))
+	cx.String(http.StatusOK, fmt.Sprintf("%s", user.token.Payload))
 }
 
 //

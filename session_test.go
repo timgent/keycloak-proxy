@@ -111,10 +111,7 @@ func getFakeRealmAccessToken(t *testing.T) jose.JWT {
 }
 
 func TestGetUserContext(t *testing.T) {
-	proxy := newFakeKeycloakProxy(t)
-	token := getFakeAccessToken(t)
-
-	context, err := proxy.getUserContext(token)
+	context, err := extractIdentity(getFakeAccessToken(t))
 	assert.NoError(t, err)
 	assert.NotNil(t, context)
 	assert.Equal(t, "1e11e539-8256-4b3b-bda8-cc0d56cddb48", context.id)
@@ -127,10 +124,7 @@ func TestGetUserContext(t *testing.T) {
 }
 
 func TestGetUserRealmRoleContext(t *testing.T) {
-	proxy := newFakeKeycloakProxy(t)
-	token := getFakeRealmAccessToken(t)
-
-	context, err := proxy.getUserContext(token)
+	context, err := extractIdentity(getFakeRealmAccessToken(t))
 	assert.NoError(t, err)
 	assert.NotNil(t, context)
 	assert.Equal(t, "1e11e539-8256-4b3b-bda8-cc0d56cddb48", context.id)
@@ -144,7 +138,6 @@ func TestGetUserRealmRoleContext(t *testing.T) {
 }
 
 func TestGetSessionToken(t *testing.T) {
-	proxy := newFakeKeycloakProxy(t)
 	token := getFakeAccessToken(t)
 	encoded := token.Encode()
 
@@ -173,7 +166,7 @@ func TestGetSessionToken(t *testing.T) {
 	}
 
 	for i, c := range testCases {
-		token, _, err := proxy.getSessionToken(c.Context)
+		user, err := getIdentity(c.Context)
 		if err != nil && c.Ok {
 			t.Errorf("test case %d should not have errored", i)
 			continue
@@ -181,21 +174,19 @@ func TestGetSessionToken(t *testing.T) {
 		if err != nil && !c.Ok {
 			continue
 		}
-		if token.Encode() != encoded {
+		if user.token.Encode() != encoded {
 			t.Errorf("test case %d the tokens are not the same", i)
 		}
 	}
 }
 
 func TestEncodeState(t *testing.T) {
-	proxy := newFakeKeycloakProxy(t)
-
-	state := &sessionState{
+	state := &refreshState{
 		refreshToken: "this is a fake session",
 		expireOn:     time.Now(),
 	}
 
-	session, err := proxy.encryptStateSession(state)
+	session, err := encryptStateSession(state, "")
 	assert.NotEmpty(t, session)
 	assert.NoError(t, err)
 }
@@ -206,7 +197,7 @@ func TestDecodeState(t *testing.T) {
 	fakeToken := "this is a fake session"
 	fakeExpiresOn := time.Now()
 
-	state := &sessionState{
+	state := &refreshState{
 		refreshToken: fakeToken,
 		expireOn:     fakeExpiresOn,
 	}

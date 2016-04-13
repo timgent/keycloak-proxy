@@ -34,6 +34,7 @@ import (
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/coreos/go-oidc/oidc"
+	"github.com/coreos/go-oidc/jose"
 )
 
 var (
@@ -136,7 +137,9 @@ func initializeOpenID(discoveryURL, clientID, clientSecret, redirectURL string, 
 	return client, config, nil
 }
 
+//
 // convertUnixTime converts a unix timestamp to a Time
+//
 func convertUnixTime(v string) (time.Time, error) {
 	i, err := strconv.ParseInt(v, 10, 64)
 	if err != nil {
@@ -146,7 +149,9 @@ func convertUnixTime(v string) (time.Time, error) {
 	return time.Unix(i, 0), nil
 }
 
+//
 // decodeKeyPairs converts a list of strings (key=pair) to a map
+//
 func decodeKeyPairs(list []string) (map[string]string, error) {
 	kp := make(map[string]string, 0)
 
@@ -161,7 +166,9 @@ func decodeKeyPairs(list []string) (map[string]string, error) {
 	return kp, nil
 }
 
+//
 // tryDialEndpoint dials the upstream endpoint via plain
+//
 func tryDialEndpoint(location *url.URL) (net.Conn, error) {
 	switch dialAddress := dialAddress(location); location.Scheme {
 	case "http":
@@ -174,12 +181,16 @@ func tryDialEndpoint(location *url.URL) (net.Conn, error) {
 	}
 }
 
+//
 // isValidMethod ensure this is a valid http method type
+//
 func isValidMethod(method string) bool {
 	return httpMethodRegex.MatchString(method)
 }
 
+//
 // fileExists check if a file exists
+//
 func fileExists(filename string) bool {
 	if _, err := os.Stat(filename); err != nil {
 		if os.IsNotExist(err) {
@@ -190,7 +201,9 @@ func fileExists(filename string) bool {
 	return true
 }
 
+//
 // hasRoles checks the scopes are the same
+//
 func hasRoles(required, issued []string) bool {
 	for _, role := range required {
 		if !containedIn(role, issued) {
@@ -201,7 +214,9 @@ func hasRoles(required, issued []string) bool {
 	return true
 }
 
+//
 // containedIn checks if a value in a list of a strings
+//
 func containedIn(value string, list []string) bool {
 	for _, x := range list {
 		if x == value {
@@ -212,7 +227,9 @@ func containedIn(value string, list []string) bool {
 	return false
 }
 
+//
 // dialAddress extracts the dial address from the url
+//
 func dialAddress(location *url.URL) string {
 	items := strings.Split(location.Host, ":")
 	if len(items) != 2 {
@@ -227,7 +244,9 @@ func dialAddress(location *url.URL) string {
 	return location.Host
 }
 
+//
 // findCookie looks for a cookie in a list of cookies
+//
 func findCookie(name string, cookies []*http.Cookie) *http.Cookie {
 	for _, cookie := range cookies {
 		if cookie.Name == name {
@@ -238,7 +257,9 @@ func findCookie(name string, cookies []*http.Cookie) *http.Cookie {
 	return nil
 }
 
+//
 // isUpgradedConnection checks to see if the request is requesting
+//
 func isUpgradedConnection(req *http.Request) bool {
 	if req.Header.Get(headerUpgrade) != "" {
 		return true
@@ -247,7 +268,9 @@ func isUpgradedConnection(req *http.Request) bool {
 	return false
 }
 
+//
 // transferBytes transfers bytes between the sink and source
+//
 func transferBytes(src io.Reader, dest io.Writer, wg *sync.WaitGroup) (int64, error) {
 	defer wg.Done()
 	copied, err := io.Copy(dest, src)
@@ -258,7 +281,34 @@ func transferBytes(src io.Reader, dest io.Writer, wg *sync.WaitGroup) (int64, er
 	return copied, nil
 }
 
+//
+// parseToken retrieve the user identity from the token
+//
+func parseToken(accessToken string) (jose.JWT, *oidc.Identity, error) {
+	// step: parse and return the token
+	token, err := jose.ParseJWT(accessToken)
+	if err != nil {
+		return jose.JWT{}, nil, err
+	}
+
+	// step: parse the claims
+	claims, err := token.Claims()
+	if err != nil {
+		return jose.JWT{}, nil, err
+	}
+
+	// step: get the identity
+	identity, err := oidc.IdentityFromClaims(claims)
+	if err != nil {
+		return jose.JWT{}, nil, err
+	}
+
+	return token, identity, nil
+}
+
+//
 // decodeResource decodes the resource specification from the command line
+//
 func decodeResource(v string) (*Resource, error) {
 	elements := strings.Split(v, "|")
 	if len(elements) <= 0 {
@@ -294,7 +344,9 @@ func decodeResource(v string) (*Resource, error) {
 	return resource, nil
 }
 
+//
 // validateResources checks and validates each of the resources
+//
 func validateResources(resources []*Resource) error {
 	for _, x := range resources {
 		if err := x.isValid(); err != nil {
