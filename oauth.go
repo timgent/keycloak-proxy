@@ -17,6 +17,7 @@ package main
 
 import (
 	"strings"
+	"time"
 
 	"github.com/coreos/go-oidc/jose"
 	"github.com/coreos/go-oidc/oauth2"
@@ -25,21 +26,22 @@ import (
 //
 // refreshToken attempts to refresh the access token, returning the parsed token and the time it expires or a error
 //
-func (r *keycloakProxy) refreshToken(refreshToken string) (jose.JWT, error) {
+func (r *keycloakProxy) refreshToken(refreshToken string) (jose.JWT, time.Time, error) {
 	response, err := r.getToken(oauth2.GrantTypeRefreshToken, refreshToken)
 	if err != nil {
 		if strings.Contains(err.Error(), "token expired") {
-			return jose.JWT{}, ErrRefreshTokenExpired
+			return jose.JWT{}, time.Time{}, ErrRefreshTokenExpired
 		}
-		return jose.JWT{}, err
-	}
-	// step: parse the access token
-	token, _, err := parseToken(response.AccessToken)
-	if err != nil {
-		return jose.JWT{}, err
+		return jose.JWT{}, time.Time{}, err
 	}
 
-	return token, nil
+	// step: parse the access token
+	token, identity, err := parseToken(response.AccessToken)
+	if err != nil {
+		return jose.JWT{}, time.Time{}, err
+	}
+
+	return token, identity.ExpiresAt, nil
 }
 
 //
@@ -69,6 +71,5 @@ func (r *keycloakProxy) getToken(grantType, code string) (oauth2.TokenResponse, 
 	}
 
 	// step: request a token from the authentication server
-	return  client.RequestToken(grantType, code)
+	return client.RequestToken(grantType, code)
 }
-

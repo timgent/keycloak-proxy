@@ -16,9 +16,6 @@ limitations under the License.
 package main
 
 import (
-
-)
-import (
 	"net/url"
 
 	log "github.com/Sirupsen/logrus"
@@ -33,8 +30,8 @@ type redisStore struct {
 func newRedisStore(location *url.URL) (Store, error) {
 	// step: parse the url notation
 	client := redis.NewClient(&redis.Options{
-		Addr:     location.Host,
-		DB:       0,
+		Addr: location.Host,
+		DB:   0,
 	})
 
 	return redisStore{
@@ -45,7 +42,7 @@ func newRedisStore(location *url.URL) (Store, error) {
 // Set adds a token to the store
 func (r redisStore) Set(key, value string) error {
 	log.WithFields(log.Fields{
-		"key": key,
+		"key":   key,
 		"value": value,
 	}).Debugf("adding the key: %s to the store", key)
 

@@ -33,8 +33,9 @@ import (
 	"time"
 
 	log "github.com/Sirupsen/logrus"
-	"github.com/coreos/go-oidc/oidc"
 	"github.com/coreos/go-oidc/jose"
+	"github.com/coreos/go-oidc/oidc"
+	"github.com/gin-gonic/gin"
 )
 
 var (
@@ -342,6 +343,39 @@ func decodeResource(v string) (*Resource, error) {
 	}
 
 	return resource, nil
+}
+
+//
+// tryUpdateConnection attempt to upgrade the connection to a http pdy stream
+//
+func tryUpdateConnection(cx *gin.Context, endpoint *url.URL) error {
+	// step: dial the endpoint
+	tlsConn, err := tryDialEndpoint(endpoint)
+	if err != nil {
+		return err
+	}
+	defer tlsConn.Close()
+
+	// step: we need to hijack the underlining client connection
+	clientConn, _, err := cx.Writer.(http.Hijacker).Hijack()
+	if err != nil {
+		return err
+	}
+	defer clientConn.Close()
+
+	// step: write the request to upstream
+	if err = cx.Request.Write(tlsConn); err != nil {
+		return err
+	}
+
+	// step: copy the date between client and upstream endpoint
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go transferBytes(tlsConn, clientConn, &wg)
+	go transferBytes(clientConn, tlsConn, &wg)
+	wg.Wait()
+
+	return nil
 }
 
 //

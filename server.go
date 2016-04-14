@@ -20,24 +20,17 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io/ioutil"
-	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"path"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/coreos/go-oidc/oidc"
-
 	log "github.com/Sirupsen/logrus"
+	"github.com/coreos/go-oidc/oidc"
 	"github.com/gin-gonic/gin"
 )
 
-//
-// keycloakProxy is the server component
-//
 type keycloakProxy struct {
 	Store
 	// the proxy configuration
@@ -94,7 +87,7 @@ func newKeycloakProxy(cfg *Config) (*keycloakProxy, error) {
 	}
 
 	// step: initialize the reverse http proxy
-	service.upstream, err = service.setupReverseProxy(cfg.Upstream)
+	service.upstream, err = service.setupReverseProxy(service.endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -112,27 +105,23 @@ func newKeycloakProxy(cfg *Config) (*keycloakProxy, error) {
 	}
 
 	// step: initialize the gin router
-	router := gin.New()
-	service.router = router
+	service.router = gin.New()
 
 	// step: load the templates
 	if err = service.setupTemplates(); err != nil {
 		return nil, err
 	}
-
+	// step: setup the gin router and add router
 	if err := service.setupRouter(); err != nil {
 		return nil, err
 	}
-
+	// step: display the protected resources
 	for _, resource := range cfg.Resources {
 		log.Infof("protecting resources under uri: %s", resource)
 	}
 	for name, value := range cfg.ClaimsMatch {
 		log.Infof("the token must container the claim: %s, required: %s", name, value)
 	}
-
-
-
 
 	return service, nil
 }
@@ -178,51 +167,6 @@ func (r *keycloakProxy) Run() error {
 	}()
 
 	return nil
-}
-
-//
-// setupRouter sets up the gin routing
-//
-func (r keycloakProxy) setupRouter() error {
-	r.router.Use(gin.Recovery())
-	// step: are we logging the traffic?
-	if r.config.LogRequests {
-		r.router.Use(r.loggingHandler())
-	}
-	// step: enabling the security filter?
-	if r.config.EnableSecurityFilter {
-		r.router.Use(r.securityHandler())
-	}
-	// step: add the routing
-	r.router.GET(authorizationURL, r.oauthAuthorizationHandler)
-	r.router.GET(callbackURL, r.oauthCallbackHandler)
-	r.router.GET(healthURL, r.healthHandler)
-	r.router.GET(tokenURL, r.tokenHandler)
-	r.router.GET(expiredURL, r.expirationHandler)
-	r.router.Use(r.entryPointHandler(), r.authenticationHandler(), r.admissionHandler())
-
-	return nil
-}
-
-//
-// setupTemplates loads the custom template
-//
-func (r *keycloakProxy) setupTemplates() {
-	var list []string
-
-	if r.config.SignInPage != "" {
-		log.Debugf("loading the custom sign in page: %s", r.config.SignInPage)
-		list = append(list, r.config.SignInPage)
-	}
-	if r.config.ForbiddenPage != "" {
-		log.Debugf("loading the custom sign forbidden page: %s", r.config.ForbiddenPage)
-		list = append(list, r.config.ForbiddenPage)
-	}
-
-	if len(list) > 0 {
-		log.Infof("loading the custom templates: %s", strings.Join(list, ","))
-		r.router.LoadHTMLFiles(list...)
-	}
 }
 
 //
@@ -299,65 +243,40 @@ func (r *keycloakProxy) injectCORSHeaders(cx *gin.Context) {
 }
 
 //
-// tryUpdateConnection attempt to upgrade the connection to a http pdy stream
+// refreshIdentity refreshes the access token for the user
 //
-func (r *keycloakProxy) tryUpdateConnection(cx *gin.Context) error {
-	// step: dial the endpoint
-	tlsConn, err := tryDialEndpoint(r.endpoint)
+func (r keycloakProxy) refreshIdentity(cx *gin.Context, user *userContext, refresh *refreshSession) (*userContext, error) {
+	// step: attempts to refresh the access token
+	token, expires, err := r.refreshToken(refresh.token)
 	if err != nil {
-		return err
-	}
-	defer tlsConn.Close()
+		// step: has the refresh token expired
+		switch err {
+		case ErrRefreshTokenExpired:
+			log.WithFields(log.Fields{"token": token}).Warningf("the refresh token has expired")
+			clearAllCookies(cx)
+		default:
+			log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed to refresh the access token")
+		}
 
-	// step: we need to hijack the underlining client connection
-	clientConn, _, err := cx.Writer.(http.Hijacker).Hijack()
-	if err != nil {
-		return err
-	}
-	defer clientConn.Close()
-
-	// step: write the request to upstream
-	if err = cx.Request.Write(tlsConn); err != nil {
-		return err
+		return user, err
 	}
 
-	// step: copy the date between client and upstream endpoint
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go transferBytes(tlsConn, clientConn, &wg)
-	go transferBytes(clientConn, tlsConn, &wg)
-	wg.Wait()
+	// step: inject the refreshed access token
+	log.WithFields(log.Fields{
+		"access_expires_in":  expires.Sub(time.Now()).String(),
+		"refresh_expires_in": refresh.expireOn.Sub(time.Now()).String(),
+	}).Infof("injecting refreshed access token, expires on: %s", expires.Format(time.RFC1123))
 
-	return nil
-}
+	// step: update the access token for the user
+	user.token = token
 
-//
-// setupReverseProxy create a reverse http proxy from the upstream
-//
-func (r *keycloakProxy) setupReverseProxy(upstream *url.URL) (reverseProxy, error) {
-	proxy := httputil.NewSingleHostReverseProxy(upstream)
-	// step: we don't care about the cert verification here
-	proxy.Transport = &http.Transport{
-		Dial: (&net.Dialer{
-			KeepAlive: 10 * time.Second,
-			Timeout:   10 * time.Second,
-		}).Dial,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: r.config.SkipUpstreamTLSVerify,
-		},
-		DisableKeepAlives:   !r.config.Keepalives,
-		TLSHandshakeTimeout: 10 * time.Second,
-	}
-
-	return proxy, nil
+	// step: create the session
+	return user, dropSessionCookie(cx, token)
 }
 
 // Add the token to the store
 func (r keycloakProxy) Set(key string, value string) error {
-	// step: encrpyt the value
-
-
-
+	// step: encrypt the value
 
 	return nil
 }
@@ -365,7 +284,6 @@ func (r keycloakProxy) Set(key string, value string) error {
 // Get retrieves a token from the store
 func (r keycloakProxy) Get(key string) (string, error) {
 	// step: the key is the access token
-
 
 	return "", nil
 }

@@ -181,9 +181,9 @@ func TestGetSessionToken(t *testing.T) {
 }
 
 func TestEncodeState(t *testing.T) {
-	state := &refreshState{
-		refreshToken: "this is a fake session",
-		expireOn:     time.Now(),
+	state := &refreshSession{
+		token:    "this is a fake session",
+		expireOn: time.Now(),
 	}
 
 	session, err := encryptStateSession(state, "")
@@ -192,26 +192,25 @@ func TestEncodeState(t *testing.T) {
 }
 
 func TestDecodeState(t *testing.T) {
-	proxy := newFakeKeycloakProxy(t)
-
+	fakeKey := "HYLNt2JSzD7Lpz0djTRudmlOpbwx1oHBtr:"
 	fakeToken := "this is a fake session"
 	fakeExpiresOn := time.Now()
 
-	state := &refreshState{
-		refreshToken: fakeToken,
-		expireOn:     fakeExpiresOn,
+	state := &refreshSession{
+		token:    fakeToken,
+		expireOn: fakeExpiresOn,
 	}
 
-	session, err := proxy.encryptStateSession(state)
+	session, err := encryptStateSession(state, fakeKey)
 	assert.NotEmpty(t, session)
 	if err != nil {
 		t.Errorf("the encryptStateSession() should not have handed an error")
 		t.FailNow()
 	}
 
-	decoded, err := proxy.decryptStateSession(session)
+	decoded, err := decryptRefreshSession(session, fakeKey)
 	assert.NotNil(t, decoded, "the session should not have been nil")
 	if assert.NoError(t, err, "the decodeState() should not have thrown an error") {
-		assert.Equal(t, fakeToken, decoded.refreshToken, "the token should been the same")
+		assert.Equal(t, fakeToken, decoded.token, "the token should been the same")
 	}
 }

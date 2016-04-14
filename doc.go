@@ -164,11 +164,10 @@ type Store interface {
 	Close() error
 }
 
-// refreshState holds the state related data
-type refreshState struct {
+// refreshSession holds the state related data
+type refreshSession struct {
 	// the max time the session is permitted
 	expireOn time.Time
 	// the refresh token
-	refreshToken string
+	token string
 }
-

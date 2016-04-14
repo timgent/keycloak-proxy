@@ -63,101 +63,93 @@ func getIdentity(cx *gin.Context) (*userContext, error) {
 
 	// step: add some logging
 	log.WithFields(log.Fields{
-		"id":	  user.id,
-		"name":   user.name,
-		"email":  user.email,
-		"roles":  strings.Join(user.roles, ","),
+		"id":    user.id,
+		"name":  user.name,
+		"email": user.email,
+		"roles": strings.Join(user.roles, ","),
 	}).Debugf("found the user identity: %s in the request", user.email)
 
 	return user, nil
 }
 
 //
-// refreshIdentity refreshes the access token for the user
-//
-func (r keycloakProxy) refreshIdentity(cx *gin.Context) (*userContext, error) {
-	// step: attempt to the retrieve the access toke, either from the store or from cookie
-	var state *refreshState
-	var err error
-
-	if r.store != nil {
-		state, err = r.Get()
-	}
-
-	// step: check if the offline session has expired
-	if time.Now().After(state.expireOn) {
-		log.Warningf("failed to refresh the access token, the refresh token has expired, expiration: %s", state.expireOn)
-		return jose.JWT{}, ErrAccessTokenExpired
-	}
-
-	// step: attempts to refresh the access token
-	token, expires, err := r.refreshToken(state.refreshToken)
-	if err != nil {
-		// step: has the refresh token expired
-		switch err {
-		case ErrRefreshTokenExpired:
-			log.WithFields(log.Fields{"token": token}).Warningf("the refresh token has expired")
-			clearSessionState(cx)
-		default:
-			log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed to refresh the access token")
-		}
-
-		return jose.JWT{}, err
-	}
-
-	// step: inject the refreshed access token
-	log.WithFields(log.Fields{
-		"access_expires_in":  expires.Sub(time.Now()).String(),
-		"refresh_expires_in": state.expireOn.Sub(time.Now()).String(),
-	}).Infof("injecting refreshed access token, expires on: %s", expires.Format(time.RFC1123))
-
-	// step: create the session
-	return token, r.createSession(token, expires, cx)
-}
-
-//
 // getSessionState retrieves the session state from the request
 //
-func (r *keycloakProxy) getSessionState(cx *gin.Context) (*refreshState, error) {
-	// step: find the session data cookie
-	cookie := findCookie(sessionStateCookieName, cx.Request.Cookies())
-	if cookie == nil {
-		return nil, ErrNoCookieFound
+func (r *keycloakProxy) getRefreshSession(cx *gin.Context, user *userContext) (*refreshSession, error) {
+	var session string
+
+	// step: are we using a store to hold the refresh token?
+	if r.store != nil {
+		v, err := r.Get(user.token.Data())
+		if err != nil {
+			return nil, err
+		}
+		session = v
+	} else {
+		// step: find the session data cookie
+		cookie := findCookie(sessionStateCookieName, cx.Request.Cookies())
+		if cookie == nil {
+			return nil, ErrNoCookieFound
+		}
 	}
 
-	return decryptStateSession(cookie.Value, r.config.EncryptionKey)
+	// step: decrypt the refresh session
+	return decryptRefreshSession(session, r.config.EncryptionKey)
 }
 
 //
-// createSession creates a session cookie with the access token
+// dropSessionCookie creates a session cookie with the access token
 //
-func (r *keycloakProxy) createSession(token jose.JWT, expires time.Time, cx *gin.Context) error {
-	http.SetCookie(cx.Writer, createSessionCookie(token.Encode(), cx.Request.Host, expires.Add(time.Duration(5)*time.Minute)))
+func dropSessionCookie(cx *gin.Context, token jose.JWT) error {
+	http.SetCookie(cx.Writer, createSessionCookie(token.Encode(), cx.Request.Host, nil))
 
 	return nil
 }
 
 //
-// createSessionState creates a session state cookie, used to hold the refresh cookie and the expiration time
+// dropRefreshCookie drops an encrypted refresh session cookie into the request
 //
-func (r *keycloakProxy) createSessionState(state *refreshState, cx *gin.Context) error {
+func dropRefreshCookie(cx *gin.Context, state *refreshSession, key string) error {
 	// step: we need to encode the state
-	encoded, err := encryptStateSession(state, r.config.EncryptionKey)
+	encoded, err := encryptStateSession(state, key)
 	if err != nil {
 		return err
 	}
+
 	// step: create a session state cookie
-	http.SetCookie(cx.Writer, createSessionStateCookie(encoded, cx.Request.Host, state.expireOn))
+	http.SetCookie(cx.Writer, createSessionRefreshCookie(encoded, cx.Request.Host, &state.expireOn))
 
 	return nil
+}
+
+//
+// clearAllCookies is just a helper function for the below
+//
+func clearAllCookies(cx *gin.Context) {
+	clearSessionCookie(cx)
+	clearRefreshSessionCookie(cx)
+}
+
+//
+// clearRefreshSessionCookie clears the session cookie
+//
+func clearRefreshSessionCookie(cx *gin.Context) {
+	http.SetCookie(cx.Writer, createSessionRefreshCookie("", cx.Request.Host, &time.Now()))
+}
+
+//
+// clearSessionCookie clears the session cookie
+//
+func clearSessionCookie(cx *gin.Context) {
+	http.SetCookie(cx.Writer, createSessionCookie("", cx.Request.Host, &time.Now()))
 }
 
 //
 // encryptStateSession encodes the session state information into a value for a cookie to consume
 //
-func encryptStateSession(session *refreshState, key string) (string, error) {
+func encryptStateSession(session *refreshSession, key string) (string, error) {
 	// step: encode the session into a string
-	encoded := fmt.Sprintf("%d|%s", session.expireOn.Unix(), session.refreshToken)
+	encoded := fmt.Sprintf("%d|%s", session.expireOn.Unix(), session.token)
 
 	// step: encrypt the cookie
 	cipherText, err := encryptDataBlock([]byte(encoded), []byte(key))
@@ -169,9 +161,9 @@ func encryptStateSession(session *refreshState, key string) (string, error) {
 }
 
 //
-// decryptStateSession decodes the session state cookie value
+// decryptRefreshSession decodes the session state cookie value
 //
-func decryptStateSession(state, key string) (*refreshState, error) {
+func decryptRefreshSession(state, key string) (*refreshSession, error) {
 	// step: decode the base64 encrypted cookie
 	cipherText, err := base64.StdEncoding.DecodeString(state)
 	if err != nil {
@@ -196,17 +188,17 @@ func decryptStateSession(state, key string) (*refreshState, error) {
 		return nil, ErrInvalidSession
 	}
 
-	return &refreshState{
-		expireOn:     expiration,
-		refreshToken: sections[1],
+	return &refreshSession{
+		expireOn: expiration,
+		token:    sections[1],
 	}, nil
 }
 
 //
 // createSessionCookie creates a new session cookie
 //
-func createSessionCookie(token, hostname string) *http.Cookie {
-	return &http.Cookie{
+func createSessionCookie(token, hostname string, expires *time.Time) *http.Cookie {
+	cookie := http.Cookie{
 		Name:     sessionCookieName,
 		Domain:   strings.Split(hostname, ":")[0],
 		Path:     "/",
@@ -214,34 +206,31 @@ func createSessionCookie(token, hostname string) *http.Cookie {
 		Secure:   true,
 		Value:    token,
 	}
+
+	if expires == nil {
+		cookie.Expires = expires
+	}
+
+	return cookie
 }
 
 //
-// createSessionStateCookie creates a new session state cookie
+// createSessionRefreshCookie creates a new session state cookie
 //
-func createSessionStateCookie(token, hostname string, expires time.Time) *http.Cookie {
-	return &http.Cookie{
+func createSessionRefreshCookie(token, hostname string, expires *time.Time) *http.Cookie {
+	cookie := http.Cookie{
 		Name:     sessionStateCookieName,
 		Domain:   strings.Split(hostname, ":")[0],
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   true,
-		Value: token,
+		Value:    token,
 	}
-}
+	if expires != nil {
+		cookie.Expires = expires
+	}
 
-//
-// clearSessionState clears the session cookie
-//
-func clearSessionState(cx *gin.Context) {
-	http.SetCookie(cx.Writer, createSessionStateCookie("", cx.Request.Host, time.Now()))
-}
-
-//
-// clearSession clears the session cookie
-//
-func clearSession(cx *gin.Context) {
-	http.SetCookie(cx.Writer, createSessionCookie("", cx.Request.Host, time.Now()))
+	return cookie
 }
 
 //
@@ -333,4 +322,3 @@ func extractIdentity(token jose.JWT) (*userContext, error) {
 		claims:        claims,
 	}, nil
 }
-

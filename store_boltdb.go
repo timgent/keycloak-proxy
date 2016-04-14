@@ -51,7 +51,7 @@ func newBoltDBStore(location *url.URL) (Store, error) {
 // Set adds a token to the store
 func (r boltdbStore) Set(key, value string) error {
 	log.WithFields(log.Fields{
-		"key": key,
+		"key":   key,
 		"value": value,
 	}).Debugf("adding the key: %s in store", key)
 
