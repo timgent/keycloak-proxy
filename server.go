@@ -26,13 +26,14 @@ import (
 	"strings"
 	"time"
 
+	"crypto/sha256"
 	log "github.com/Sirupsen/logrus"
+	"github.com/coreos/go-oidc/jose"
 	"github.com/coreos/go-oidc/oidc"
 	"github.com/gin-gonic/gin"
 )
 
 type keycloakProxy struct {
-	Store
 	// the proxy configuration
 	config *Config
 	// the gin service
@@ -245,9 +246,9 @@ func (r *keycloakProxy) injectCORSHeaders(cx *gin.Context) {
 //
 // refreshIdentity refreshes the access token for the user
 //
-func (r keycloakProxy) refreshIdentity(cx *gin.Context, user *userContext, refresh *refreshSession) (*userContext, error) {
+func (r keycloakProxy) refreshIdentity(cx *gin.Context, user *userContext, refresh *RefreshToken) (jose.JWT, error) {
 	// step: attempts to refresh the access token
-	token, expires, err := r.refreshToken(refresh.token)
+	token, expires, err := r.refreshToken(refresh.Token())
 	if err != nil {
 		// step: has the refresh token expired
 		switch err {
@@ -258,42 +259,68 @@ func (r keycloakProxy) refreshIdentity(cx *gin.Context, user *userContext, refre
 			log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed to refresh the access token")
 		}
 
-		return user, err
+		return token, err
 	}
 
 	// step: inject the refreshed access token
 	log.WithFields(log.Fields{
 		"access_expires_in":  expires.Sub(time.Now()).String(),
-		"refresh_expires_in": refresh.expireOn.Sub(time.Now()).String(),
+		"refresh_expires_in": refresh.Expiration().Sub(time.Now()).String(),
 	}).Infof("injecting refreshed access token, expires on: %s", expires.Format(time.RFC1123))
 
-	// step: update the access token for the user
-	user.token = token
+	// step: clear the cookie up
+	dropAccessTokenCookie(cx, token)
 
-	// step: create the session
-	return user, dropSessionCookie(cx, token)
+	return token, nil
 }
 
-// Add the token to the store
-func (r keycloakProxy) Set(key string, value string) error {
-	// step: encrypt the value
-
-	return nil
+//
+// StoreRefreshToken the token to the store
+//
+func (r keycloakProxy) StoreRefreshToken(token *jose.JWT, value string) error {
+	return r.store.Set(getHashKey(token), value)
 }
 
-// Get retrieves a token from the store
-func (r keycloakProxy) Get(key string) (string, error) {
+//
+// Get retrieves a token from the store, the key we are using here is the access token
+//
+func (r keycloakProxy) GetRefreshToken(token *jose.JWT) (string, error) {
 	// step: the key is the access token
+	v, err := r.store.Get(getHashKey(token))
+	if err != nil {
+		return v, err
+	}
+	if v == "" {
+		return v, ErrNoSessionStateFound
+	}
 
-	return "", nil
+	return v, nil
 }
 
-// Delete removes a key from the store
-func (r keycloakProxy) Delete(string) error {
+//
+// DeleteRefreshToken removes a key from the store
+//
+func (r keycloakProxy) DeleteRefreshToken(token jose.JWT) error {
+	if err := r.store.Delete(getHashKey(&token)); err != nil {
+		log.WithFields(log.Fields{
+			"error": err.Error(),
+		}).Errorf("failed to delete the token from store")
+
+		return err
+	}
+
 	return nil
 }
 
 // Close is used to close off any resources
-func (r keycloakProxy) Close() error {
+func (r keycloakProxy) CloseStore() error {
+	if r.store != nil {
+		return r.store.Close()
+	}
+
 	return nil
+}
+
+func getHashKey(token *jose.JWT) string {
+	return string(sha256.New().Sum([]byte(token.Encode())))
 }

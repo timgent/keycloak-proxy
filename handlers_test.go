@@ -163,7 +163,7 @@ func TestEntrypointHandler(t *testing.T) {
 		{Context: newFakeGinContext("GET", "/not_secure")},
 		{Context: newFakeGinContext("GET", fakeTestWhitelistedURL)},
 		{Context: newFakeGinContext("GET", oauthURL)},
-		{Context: newFakeGinContext("GET", faketestListenOrdered), Secure: true},
+		{Context: newFakeGinContext("GET", fakeTestListenOrdered), Secure: true},
 	}
 
 	for i, c := range tests {

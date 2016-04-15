@@ -180,54 +180,105 @@ func (r *keycloakProxy) authenticationHandler() gin.HandlerFunc {
 
 		// step: verify the access token
 		if err := r.verifyToken(user.token); err != nil {
+
 			// step: if the error post verification is anything other than a token expired error
 			// we immediately throw an access forbidden - as there is something messed up in the token
 			if err != ErrAccessTokenExpired {
-				log.WithFields(log.Fields{"error": err.Error()}).Errorf("access token has expired")
+				log.WithFields(log.Fields{"error": err.Error()}).Errorf("verification of the access token failed")
+
 				r.accessForbidden(cx)
 				return
 			}
+
 			// step: are we refreshing the access tokens?
 			if !r.config.RefreshSessions {
 				log.WithFields(log.Fields{
 					"username":   user.name,
 					"expired_on": user.expiresAt.String(),
 				}).Errorf("the session has expired and token refreshing is disabled")
+
 				r.redirectToAuthorization(cx)
 				return
 			}
+
 			// step: we do not refresh bearer token requests
 			if user.isBearerToken() {
 				log.WithFields(log.Fields{
 					"username":   user.name,
 					"expired_on": user.expiresAt.String(),
 				}).Errorf("the session has expired and we are using bearer token")
+
 				r.redirectToAuthorization(cx)
 				return
 			}
+
 			// step: attempt to get the refresh session from cookie or store
-			refresh, err := r.getRefreshSession(cx, user)
+			refresh, err := r.getRefreshFromRequest(cx, user)
 			if err != nil {
 				log.WithFields(log.Fields{
 					"username":   user.name,
 					"expired_on": user.expiresAt.String(),
 					"error":      err.Error(),
 				}).Errorf("failed to retrieve the refresh session, ")
+				// step: remove the access cookie, no longer required
+				clearSessionCookie(cx)
+
+				r.redirectToAuthorization(cx)
+				return
 			}
+
 			// step: check if the offline session has expired
-			if refresh.expireOn.Before(time.Now()) {
-				log.Warningf("failed to refresh the access token, the refresh token has expired, expiration: %s", refresh.expireOn)
+			if refresh.Expiration().Before(time.Now()) {
+				log.Warningf("unable to refresh the access token, token has expired, expiration: %s", refresh.Expiration())
+				// step: remove all the cookies
 				clearAllCookies(cx)
+
 				r.redirectToAuthorization(cx)
 				return
 			}
+
 			// step: attempt to refresh the user token
-			user, err := r.refreshIdentity(cx, user, refresh)
+			token, err := r.refreshIdentity(cx, user, refresh)
 			if err != nil {
-				log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed to refresh the access token")
+				log.WithFields(log.Fields{
+					"error": err.Error(),
+				}).Errorf("failed to refresh the access token")
+
 				r.redirectToAuthorization(cx)
 				return
 			}
+
+			// step: drop the new access token
+			dropAccessTokenCookie(cx, token)
+
+			if r.store != nil {
+				// step: the access token has been updated, we need to delete old reference and update the store
+				if err := r.DeleteRefreshToken(user.token); err != nil {
+					log.WithFields(log.Fields{
+						"error": err.Error(),
+					}).Errorf("unable to delete the old refresh tokem from store")
+				}
+
+				// step: encrypt the refresh token
+				encrypted, err := encryptRefreshToken(refresh, r.config.EncryptionKey)
+				if err != nil {
+					log.WithFields(log.Fields{
+						"error": err.Error(),
+					}).Errorf("unable to encrypt the refresh token")
+				}
+
+				// step: store the new refresh token reference place the session in the store
+				if err := r.StoreRefreshToken(&token, encrypted); err != nil {
+					log.WithFields(log.Fields{
+						"error": err.Error(),
+					}).Errorf("failed to place the refresh token in the store")
+
+					return
+				}
+			}
+			// step: update the with the new access token
+			user.token = token
+
 			// step: inject the user into the context
 			cx.Set(userContextName, user)
 		}
@@ -289,13 +340,14 @@ func (r *keycloakProxy) admissionHandler() gin.HandlerFunc {
 					"access":   "denied",
 					"username": user.name,
 					"resource": resource.URL,
-					"required": resource.getRoles(),
+					"required": resource.GetRoles(),
 				}).Warnf("access denied, invalid roles")
 				r.accessForbidden(cx)
 
 				return
 			}
 		}
+
 		// step: if we have any claim matching, validate the tokens has the claims
 		for claimName, match := range claimMatches {
 			// step: if the claim is NOT in the token, we access deny
@@ -489,6 +541,7 @@ func (r *keycloakProxy) oauthCallbackHandler(cx *gin.Context) {
 		r.accessForbidden(cx)
 		return
 	}
+
 	// step: verify the token is valid
 	if err := r.verifyToken(token); err != nil {
 		log.WithFields(log.Fields{"error": err.Error()}).Errorf("unable to verify the id token")
@@ -496,10 +549,12 @@ func (r *keycloakProxy) oauthCallbackHandler(cx *gin.Context) {
 		return
 	}
 
-	// step: attempt to decode the access token?
+	// step: attempt to decode the access token else we default to the id token
 	accessToken, id, err := parseToken(response.AccessToken)
 	if err != nil {
-		log.WithFields(log.Fields{"error": err.Error()}).Errorf("unable to parse the access token, using id token only")
+		log.WithFields(log.Fields{
+			"error": err.Error(),
+		}).Errorf("unable to parse the access token, using id token only")
 	} else {
 		token = accessToken
 		identity = id
@@ -508,23 +563,17 @@ func (r *keycloakProxy) oauthCallbackHandler(cx *gin.Context) {
 	log.WithFields(log.Fields{
 		"email":   identity.Email,
 		"expires": identity.ExpiresAt,
-	}).Infof("issuing a user session")
+	}).Infof("issuing a new session for user: %s", identity.Email)
 
 	// step: drop's a session cookie with the access token
-	if err := dropSessionCookie(cx, token); err != nil {
-		log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed to inject the session token")
-		cx.AbortWithStatus(http.StatusInternalServerError)
-
-		return
-	}
+	dropAccessTokenCookie(cx, token)
 
 	// step: are we using refresh tokens?
 	if r.config.RefreshSessions {
 		// step: create the state session
-		state := &refreshSession{
-			token: response.RefreshToken,
-			expireOn:     time.Now().Add(r.config.MaxSession),
-		}
+		state := new(RefreshToken).
+			SetToken(response.RefreshToken).
+			SetExpiration(time.Now().Add(r.config.MaxSession))
 
 		// step: can we parse and extract the refresh token from the response
 		// - note, the refresh token can be custom, i.e. doesn't have to be a jwt i.e. google for example
@@ -532,35 +581,53 @@ func (r *keycloakProxy) oauthCallbackHandler(cx *gin.Context) {
 		if err != nil {
 			log.WithFields(log.Fields{
 				"error": err.Error(),
-			}).Errorf("unable to parse refresh token (unknown format) using the as a static string")
+			}).Errorf("unable to parse refresh token (unknown format) using as a static string")
 		} else {
 			// step: set the expiration of the refresh token.
 			// - first we check if the duration exceeds the expiration of the refresh token
 			if state.expireOn.After(refreshToken.ExpiresAt) {
 				log.WithFields(log.Fields{
-					"email":       refreshToken.Email,
 					"max_session": r.config.MaxSession.String(),
-					"duration":    state.expireOn.Format(time.RFC1123),
-					"refresh":     refreshToken.ExpiresAt.Format(time.RFC1123),
+					"duration":    state.Expiration().Sub(time.Now()).String(),
+					"email":       identity.Email,
 				}).Errorf("max session exceeds the expiration of the refresh token, defaulting to refresh token")
-				state.expireOn = refreshToken.ExpiresAt
+
+				state.SetExpiration(refreshToken.ExpiresAt)
 			}
 		}
-		/*
-		// step: create and inject the state session
-		if err := drop(state, cx); err != nil {
-			log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed to inject the session state into request")
+
+		// step: encode the refresh token
+		encrypted, err := encryptRefreshToken(state, r.config.EncryptionKey)
+		if err != nil {
+			log.WithFields(log.Fields{
+				"error": err.Error(),
+			}).Errorf("failed to encrypt the refresh token")
 
 			cx.AbortWithStatus(http.StatusInternalServerError)
 			return
 		}
-		*/
+
+		// step: create and inject the state session
+		if r.store == nil {
+			// we are not using a store, thus we drop the state in a encrypted cookie
+			dropRefreshTokenCookie(cx, encrypted, state.Expiration())
+		} else {
+			// place the session in the store
+			if err := r.StoreRefreshToken(&accessToken, encrypted); err != nil {
+				log.WithFields(log.Fields{
+					"error": err.Error(),
+				}).Errorf("failed to place the refresh token in the store")
+
+				cx.AbortWithStatus(http.StatusInternalServerError)
+				return
+			}
+		}
 
 		// step: some debugging is useful here
 		log.WithFields(log.Fields{
 			"email":      identity.Email,
 			"client_ip":  cx.ClientIP(),
-			"expires_in": state.expireOn.Sub(time.Now()).String(),
+			"expires_in": state.Expiration().Sub(time.Now()).String(),
 		}).Infof("successfully retrieve refresh token for client: %s", identity.Email)
 	}
 

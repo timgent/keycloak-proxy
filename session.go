@@ -17,14 +17,12 @@ package main
 
 import (
 	"encoding/base64"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/coreos/go-oidc/jose"
-	"github.com/coreos/go-oidc/oidc"
 	"github.com/gin-gonic/gin"
 )
 
@@ -35,6 +33,37 @@ const (
 	claimRealmAccess    = "realm_access"
 	claimResourceRoles  = "roles"
 )
+
+//
+// getRefreshFromRequest retrieves the session state from the request
+//
+func (r *keycloakProxy) getRefreshFromRequest(cx *gin.Context, user *userContext) (*RefreshToken, error) {
+	var encoded string
+
+	// step: are we using a store to hold the refresh token?
+	if r.store != nil {
+		v, err := r.GetRefreshToken(&user.token)
+		if err != nil {
+			return nil, err
+		}
+		encoded = v
+	} else {
+		// step: find the session data cookie
+		cookie := findCookie(cookieRefreshToken, cx.Request.Cookies())
+		if cookie == nil {
+			return nil, ErrNoSessionStateFound
+		}
+	}
+
+	// step: decrypt the refresh token
+	refresh, err := decryptRefreshToken(encoded, r.config.EncryptionKey)
+	if err != nil {
+		return nil, err
+	}
+
+	// step: decode and return refresh token
+	return refresh, nil
+}
 
 //
 // getIdentity retrieves the user identity from a request, either from a session cookie or a bearer token
@@ -73,53 +102,30 @@ func getIdentity(cx *gin.Context) (*userContext, error) {
 }
 
 //
-// getSessionState retrieves the session state from the request
+// dropCookie drops a cookie into the response
 //
-func (r *keycloakProxy) getRefreshSession(cx *gin.Context, user *userContext) (*refreshSession, error) {
-	var session string
-
-	// step: are we using a store to hold the refresh token?
-	if r.store != nil {
-		v, err := r.Get(user.token.Data())
-		if err != nil {
-			return nil, err
-		}
-		session = v
-	} else {
-		// step: find the session data cookie
-		cookie := findCookie(sessionStateCookieName, cx.Request.Cookies())
-		if cookie == nil {
-			return nil, ErrNoCookieFound
-		}
+func dropCookie(cx *gin.Context, name, value string, expires time.Time) {
+	cookie := &http.Cookie{
+		Name:     name,
+		Domain:   strings.Split(cx.Request.Host, ":")[0],
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		Value:    value,
+	}
+	if !expires.IsZero() {
+		cookie.Expires = expires
 	}
 
-	// step: decrypt the refresh session
-	return decryptRefreshSession(session, r.config.EncryptionKey)
+	http.SetCookie(cx.Writer, cookie)
 }
 
-//
-// dropSessionCookie creates a session cookie with the access token
-//
-func dropSessionCookie(cx *gin.Context, token jose.JWT) error {
-	http.SetCookie(cx.Writer, createSessionCookie(token.Encode(), cx.Request.Host, nil))
-
-	return nil
+func dropAccessTokenCookie(cx *gin.Context, token jose.JWT) {
+	dropCookie(cx, cookieAccessToken, token.Encode(), time.Time{})
 }
 
-//
-// dropRefreshCookie drops an encrypted refresh session cookie into the request
-//
-func dropRefreshCookie(cx *gin.Context, state *refreshSession, key string) error {
-	// step: we need to encode the state
-	encoded, err := encryptStateSession(state, key)
-	if err != nil {
-		return err
-	}
-
-	// step: create a session state cookie
-	http.SetCookie(cx.Writer, createSessionRefreshCookie(encoded, cx.Request.Host, &state.expireOn))
-
-	return nil
+func dropRefreshTokenCookie(cx *gin.Context, token string, expires time.Time) {
+	dropCookie(cx, cookieRefreshToken, token, expires)
 }
 
 //
@@ -127,32 +133,29 @@ func dropRefreshCookie(cx *gin.Context, state *refreshSession, key string) error
 //
 func clearAllCookies(cx *gin.Context) {
 	clearSessionCookie(cx)
-	clearRefreshSessionCookie(cx)
+	clearRefreshTokenCookie(cx)
 }
 
 //
 // clearRefreshSessionCookie clears the session cookie
 //
-func clearRefreshSessionCookie(cx *gin.Context) {
-	http.SetCookie(cx.Writer, createSessionRefreshCookie("", cx.Request.Host, &time.Now()))
+func clearRefreshTokenCookie(cx *gin.Context) {
+	dropCookie(cx, cookieRefreshToken, "", time.Now())
 }
 
 //
 // clearSessionCookie clears the session cookie
 //
 func clearSessionCookie(cx *gin.Context) {
-	http.SetCookie(cx.Writer, createSessionCookie("", cx.Request.Host, &time.Now()))
+	dropCookie(cx, cookieAccessToken, "", time.Now())
 }
 
 //
-// encryptStateSession encodes the session state information into a value for a cookie to consume
+// encryptRefreshToken encodes the session state information into a value for a cookie to consume
 //
-func encryptStateSession(session *refreshSession, key string) (string, error) {
-	// step: encode the session into a string
-	encoded := fmt.Sprintf("%d|%s", session.expireOn.Unix(), session.token)
-
-	// step: encrypt the cookie
-	cipherText, err := encryptDataBlock([]byte(encoded), []byte(key))
+func encryptRefreshToken(session *RefreshToken, key string) (string, error) {
+	// step: encrypt the refresh state
+	cipherText, err := encryptDataBlock([]byte(session.Encode()), []byte(key))
 	if err != nil {
 		return "", err
 	}
@@ -161,9 +164,9 @@ func encryptStateSession(session *refreshSession, key string) (string, error) {
 }
 
 //
-// decryptRefreshSession decodes the session state cookie value
+// decryptRefreshToken decodes the session state cookie value
 //
-func decryptRefreshSession(state, key string) (*refreshSession, error) {
+func decryptRefreshToken(state, key string) (*RefreshToken, error) {
 	// step: decode the base64 encrypted cookie
 	cipherText, err := base64.StdEncoding.DecodeString(state)
 	if err != nil {
@@ -171,78 +174,24 @@ func decryptRefreshSession(state, key string) (*refreshSession, error) {
 	}
 
 	// step: decrypt the cookie back in the expiration|token
-	plainText, err := decryptDataBlock(cipherText, []byte(key))
+	encoded, err := decryptDataBlock(cipherText, []byte(key))
 	if err != nil {
 		return nil, ErrInvalidSession
 	}
 
-	// step: extracts the sections from the state
-	sections := strings.Split(string(plainText), "|")
-	if len(sections) != 2 {
-		return nil, ErrInvalidSession
-	}
-
-	// step: convert the unit timestamp
-	expiration, err := convertUnixTime(sections[0])
-	if err != nil {
-		return nil, ErrInvalidSession
-	}
-
-	return &refreshSession{
-		expireOn: expiration,
-		token:    sections[1],
-	}, nil
-}
-
-//
-// createSessionCookie creates a new session cookie
-//
-func createSessionCookie(token, hostname string, expires *time.Time) *http.Cookie {
-	cookie := http.Cookie{
-		Name:     sessionCookieName,
-		Domain:   strings.Split(hostname, ":")[0],
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		Value:    token,
-	}
-
-	if expires == nil {
-		cookie.Expires = expires
-	}
-
-	return cookie
-}
-
-//
-// createSessionRefreshCookie creates a new session state cookie
-//
-func createSessionRefreshCookie(token, hostname string, expires *time.Time) *http.Cookie {
-	cookie := http.Cookie{
-		Name:     sessionStateCookieName,
-		Domain:   strings.Split(hostname, ":")[0],
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		Value:    token,
-	}
-	if expires != nil {
-		cookie.Expires = expires
-	}
-
-	return cookie
+	return newRefreshToken(string(encoded))
 }
 
 //
 // getTokenFromBearer attempt to retrieve token from bearer token
 //
 func getTokenFromBearer(cx *gin.Context) (jose.JWT, error) {
-	authz := cx.Request.Header.Get(authorizationHeader)
-	if authz == "" {
+	auth := cx.Request.Header.Get(authorizationHeader)
+	if auth == "" {
 		return jose.JWT{}, ErrSessionNotFound
 	}
 
-	items := strings.Split(authz, " ")
+	items := strings.Split(auth, " ")
 	if len(items) != 2 {
 		return jose.JWT{}, ErrInvalidSession
 	}
@@ -255,70 +204,10 @@ func getTokenFromBearer(cx *gin.Context) (jose.JWT, error) {
 //
 func getTokenFromCookie(cx *gin.Context) (jose.JWT, error) {
 	// step: find the authentication cookie from the request
-	cookie := findCookie(sessionCookieName, cx.Request.Cookies())
+	cookie := findCookie(cookieAccessToken, cx.Request.Cookies())
 	if cookie == nil {
 		return jose.JWT{}, ErrSessionNotFound
 	}
 
 	return jose.ParseJWT(cookie.Value)
-}
-
-//
-// extractIdentity parse the jwt token and extracts the various elements is order to construct
-//
-func extractIdentity(token jose.JWT) (*userContext, error) {
-	// step: decode the claims from the tokens
-	claims, err := token.Claims()
-	if err != nil {
-		return nil, err
-	}
-	// step: extract the identity
-	identity, err := oidc.IdentityFromClaims(claims)
-	if err != nil {
-		return nil, err
-	}
-	// step: ensure we have and can extract the preferred name of the user, if not, we set to the ID
-	preferredName, found, err := claims.StringClaim(claimPreferredName)
-	if err != nil || !found {
-		// choice: set the preferredName to the Email if claim not found
-		preferredName = identity.Email
-	}
-	// step: retrieve the audience from access token
-	audience, found, err := claims.StringClaim(claimAudience)
-	if err != nil || !found {
-		return nil, fmt.Errorf("the access token does not container a audience claim")
-	}
-	var list []string
-
-	// step: extract the realm roles
-	if realmRoles, found := claims[claimRealmAccess].(map[string]interface{}); found {
-		if roles, found := realmRoles[claimResourceRoles]; found {
-			for _, r := range roles.([]interface{}) {
-				list = append(list, fmt.Sprintf("%s", r))
-			}
-		}
-	}
-	// step: extract the roles from the access token
-	if accesses, found := claims[claimResourceAccess].(map[string]interface{}); found {
-		for roleName, roleList := range accesses {
-			scopes := roleList.(map[string]interface{})
-			if roles, found := scopes[claimResourceRoles]; found {
-				for _, r := range roles.([]interface{}) {
-					list = append(list, fmt.Sprintf("%s:%s", roleName, r))
-				}
-			}
-		}
-	}
-
-	return &userContext{
-		id:            identity.ID,
-		name:          preferredName,
-		audience:      audience,
-		preferredName: preferredName,
-		email:         identity.Email,
-		expiresAt:     identity.ExpiresAt,
-		roles:         list,
-		token:         token,
-		claims:        claims,
-	}, nil
 }

@@ -105,7 +105,7 @@ func (r *Config) isValid() error {
 	}
 	// step: valid the resources
 	for _, resource := range r.Resources {
-		if err := resource.isValid(); err != nil {
+		if err := resource.IsValid(); err != nil {
 			return err
 		}
 	}

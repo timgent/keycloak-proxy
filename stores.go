@@ -38,5 +38,5 @@ func newStore(location string) (Store, error) {
 		return nil, fmt.Errorf("unsupport store: %s", u.Scheme)
 	}
 
-	return store, nil
+	return store, err
 }

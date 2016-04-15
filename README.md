@@ -192,7 +192,6 @@ DEBU[0002] resource access permitted: /favicon.ico       access=permitted bearer
 2016-02-06 13:59:01.856716 I | http: proxy error: dial tcp 127.0.0.1:8081: getsockopt: connection refused
 ```
 
-
 #### **Upstream Headers**
 
 On protected resources the upstream endpoint will receive a number of headers added by the proxy;
@@ -266,6 +265,12 @@ Or on the command line
 
 The proxy support enforcing mutual TLS for the clients by simply adding the --tls-ca-certificate command line option or config file option. All clients connecting must present a ceritificate
 which was signed by the CA being used.
+
+#### **Refresh Tokens**
+
+Refresh tokens (--refresh-sessions=true) request a offline access type from the provider and will refresh the access token as and when they expire. By default the refresh tokens are dropped in as
+an encrypted cookie (--encryption-key=KEY). Alternatively you can place the refresh token (still requires encryption key) in a local boltdb file or shared redis. Naturally the encryption key has to 
+be the same on all instances and boltdb is for single instance only developments.
 
 #### **Endpoints**
 

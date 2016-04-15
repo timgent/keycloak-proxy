@@ -101,13 +101,13 @@ func newFakeKeycloakProxy(t *testing.T) *keycloakProxy {
 	log.SetOutput(ioutil.Discard)
 
 	kc := &keycloakProxy{
-		config: newFakeKeycloakConfig(t),
-		proxy:  new(fakeReverseProxy),
+		config:   newFakeKeycloakConfig(t),
+		upstream: new(fakeReverseProxy),
 	}
 	kc.router = gin.New()
 	gin.SetMode(gin.ReleaseMode)
 	// step: add the gin routing
-	kc.initializeRouter()
+	kc.setupRouter()
 
 	return kc
 }
@@ -118,7 +118,7 @@ func TestNewKeycloakProxy(t *testing.T) {
 	assert.NotNil(t, proxy)
 	assert.NotNil(t, proxy.config)
 	assert.NotNil(t, proxy.router)
-	assert.NotNil(t, proxy.upstreamURL)
+	assert.NotNil(t, proxy.endpoint)
 }
 
 func TestRedirectToAuthorization(t *testing.T) {
@@ -153,7 +153,7 @@ func TestInitializeReverseProxy(t *testing.T) {
 	proxy := newFakeKeycloakProxy(t)
 
 	uri, _ := url.Parse("http://127.0.0.1:8080")
-	reverse, err := proxy.initializeReverseProxy(uri)
+	reverse, err := proxy.setupReverseProxy(uri)
 	assert.NoError(t, err)
 	assert.NotNil(t, reverse)
 }

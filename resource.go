@@ -20,8 +20,8 @@ import (
 	"strings"
 )
 
-// isValid ensure the resource is valid
-func (r *Resource) isValid() error {
+// IsValid ensure the resource is valid
+func (r *Resource) IsValid() error {
 	// step: ensure everything is initialized
 	if r.Methods == nil {
 		r.Methods = make([]string, 0)
@@ -54,8 +54,8 @@ func (r *Resource) isValid() error {
 	return nil
 }
 
-// getRoles gets a list of roles
-func (r Resource) getRoles() string {
+// GetRoles gets a list of roles
+func (r Resource) GetRoles() string {
 	return strings.Join(r.Roles, ",")
 }
 

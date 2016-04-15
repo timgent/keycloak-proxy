@@ -47,7 +47,7 @@ func TestIsValid(t *testing.T) {
 	}
 
 	for i, c := range testCases {
-		err := c.Resource.isValid()
+		err := c.Resource.IsValid()
 		if err != nil && c.Ok {
 			t.Errorf("case %d should not have failed", i)
 		}
@@ -68,7 +68,7 @@ func TestGetRoles(t *testing.T) {
 		Roles: []string{"1", "2", "3"},
 	}
 
-	if resource.getRoles() != "1,2,3" {
+	if resource.GetRoles() != "1,2,3" {
 		t.Error("the resource roles not as expected")
 	}
 }

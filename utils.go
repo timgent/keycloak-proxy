@@ -383,7 +383,7 @@ func tryUpdateConnection(cx *gin.Context, endpoint *url.URL) error {
 //
 func validateResources(resources []*Resource) error {
 	for _, x := range resources {
-		if err := x.isValid(); err != nil {
+		if err := x.IsValid(); err != nil {
 			return err
 		}
 	}

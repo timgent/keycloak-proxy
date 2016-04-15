@@ -16,7 +16,9 @@ limitations under the License.
 package main
 
 import (
+	"errors"
 	"net/url"
+	"strings"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
@@ -27,6 +29,10 @@ const (
 	dbName = "keycloak"
 )
 
+var (
+	ErrNoBoltdbBucket = errors.New("the boltdb bucket does not exists")
+)
+
 //
 // A local file store used to hold the refresh tokens
 //
@@ -35,17 +41,26 @@ type boltdbStore struct {
 }
 
 func newBoltDBStore(location *url.URL) (Store, error) {
-	log.Infof("creating the bolddb store, file: %s", location.Path)
-	db, err := bolt.Open(location.Path, 0600, &bolt.Options{
+	// step: drop the initial slash
+	path := strings.TrimPrefix(location.Path, "/")
+
+	log.Infof("creating the bolddb store, file: %s", path)
+	db, err := bolt.Open(path, 0600, &bolt.Options{
 		Timeout: time.Duration(10 * time.Second),
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	// step: create the bucket
+	err = db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte(dbName))
+		return err
+	})
+
 	return &boltdbStore{
 		client: db,
-	}, nil
+	}, err
 }
 
 // Set adds a token to the store
@@ -56,8 +71,11 @@ func (r boltdbStore) Set(key, value string) error {
 	}).Debugf("adding the key: %s in store", key)
 
 	return r.client.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(dbName))
-		return b.Put([]byte(key), []byte(value))
+		bucket := tx.Bucket([]byte(dbName))
+		if bucket == nil {
+			return ErrNoBoltdbBucket
+		}
+		return bucket.Put([]byte(key), []byte(value))
 	})
 }
 
@@ -69,8 +87,11 @@ func (r boltdbStore) Get(key string) (string, error) {
 
 	var value string
 	err := r.client.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(dbName))
-		value = string(b.Get([]byte(key)))
+		bucket := tx.Bucket([]byte(dbName))
+		if bucket == nil {
+			return ErrNoBoltdbBucket
+		}
+		value = string(bucket.Get([]byte(key)))
 		return nil
 	})
 
@@ -84,8 +105,11 @@ func (r boltdbStore) Delete(key string) error {
 	}).Debugf("deleting the key: %s from store", key)
 
 	return r.client.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(dbName))
-		return b.Delete([]byte(key))
+		bucket := tx.Bucket([]byte(dbName))
+		if bucket == nil {
+			return ErrNoBoltdbBucket
+		}
+		return bucket.Delete([]byte(key))
 	})
 }
 
