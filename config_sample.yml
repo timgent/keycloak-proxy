@@ -1,45 +1,61 @@
 
 
 # is the url for retrieve the openid configuration - normally the <server>/auth/realm/<realm_name>
-discovery_url: https://keycloak.example.com/auth/realms/commons
+discovery-url: https://keycloak.example.com/auth/realms/commons
 # the client id for the 'client' application
-clientid: <CLIENT_ID>
-# the secret associated to the 'client' application
-secret: <CLIENT_SECRET>
+client-id: <CLIENT_ID>
+# the secret associated to the 'client' application - note the client_secret is optional, required for
+# oauth2 access_type=confidential i.e. the client is being verified
+client-secret: <CLIENT_SECRET>
 # the interface definition you wish the proxy to listen, all interfaces is specified as ':<port>'
 listen: 127.0.0.1:3000
 # whether to request offline access and use a refresh token
-refresh_sessions: true
-# assuming you are using refresh tokens, specify the maximum amount of time the refresh token can last
-max-session: 1h
+enable-refresh-tokens: true
+# the max amount of time a session can stay alive without being used
+idle-duration: 24h
 # log all incoming requests
-log_requests: true
+log-requests: true
 # log in json format
-log_json_format: true
+log-json-format: true
 # do not redirec the request, simple 307 it
 no-redirects: false
 # the location of a certificate you wish the proxy to use for TLS support
-tls_cert:
+tls-cert:
 # the location of a private key for TLS
-tls_private_key:
+tls-private-key:
+# the public key for the ca, used for mutual TLS
+tls-ca-certificate:
 # the redirection url, essentially the site url, note: /oauth/callback is added at the end
-redirection_url: http://127.0.0.3000
+redirection-url: http://127.0.0.3000
 # the encryption key used to encode the session state
-encryption_key: AgXa7xRcoClDEU0ZDSH4X0XhL5Qy2Z2j
+encryption-key: vGcLt8ZUdPX5fXhtLZaPHZkGWHZrT6T8xKHWf5RPfqAocuiQ6nUbNHyc3oF2toO2tr
+# the name of the access cookie, defaults to kc-access
+access-cookie-name:
+# the name of the refresh cookie, default to kc-state
+refresh-cookie-name:
 # the upstream endpoint which we should proxy request
-upstream: http://127.0.0.1:80
+upstream-url: http://127.0.0.1:80
 # upstream-keepalives specified wheather you want keepalive on the upstream endpoint
 upstream-keepalives: true
+# skip the tls verification of the upstream url
+skip-upstream-tls-verify: true|false
 # additional scopes to add to add to the default (openid+email+profile)
-scopes:
-  - vpn-user
+scopes: []
 # enables a more extra secuirty features
 enable-security-filter: true
+# headers permits you to inject custom headers into all request
+headers:
+  myheader_name: my_header_value
 # a map of claims that MUST exist in the token presented and the value is it MUST match
 # So for example, you could match the audience or the issuer or some custom attribute
-claims:
+match-claims:
   aud: openvpn
   iss: https://keycloak.example.com/auth/realms/commons
+# a list of claims to inject into the authentication headers i.e. given_name -> X-Auth-Given-Name
+add-claims:
+- given_name
+- family_name
+- name
 # a collection of resource i.e. urls that you wish to protect
 resources:
   - url: /admin/test

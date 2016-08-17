@@ -18,17 +18,100 @@ package main
 import (
 	"testing"
 	"time"
+
+	"github.com/coreos/go-oidc/jose"
+	"github.com/stretchr/testify/assert"
 )
+
+func newFakeAccessToken() jose.JWT {
+	testToken, _ := jose.NewJWT(
+		jose.JOSEHeader{
+			"alg": "RS256",
+		},
+		jose.Claims{
+			"jti": "4ee75b8e-3ee6-4382-92d4-3390b4b4937b",
+			//"exp": "1450372969",
+			"nbf":            0,
+			"iat":            "1450372669",
+			"iss":            "https://keycloak.example.com/auth/realms/commons",
+			"aud":            "test",
+			"sub":            "1e11e539-8256-4b3b-bda8-cc0d56cddb48",
+			"typ":            "Bearer",
+			"azp":            "clientid",
+			"session_state":  "98f4c3d2-1b8c-4932-b8c4-92ec0ea7e195",
+			"client_session": "f0105893-369a-46bc-9661-ad8c747b1a69",
+			"resource_access": map[string]interface{}{
+				"openvpn": map[string]interface{}{
+					"roles": []string{
+						"dev-vpn",
+					},
+				},
+			},
+			"email":              "gambol99@gmail.com",
+			"name":               "Rohith Jayawardene",
+			"family_name":        "Jayawardene",
+			"preferred_username": "rjayawardene",
+			"given_name":         "Rohith",
+		},
+	)
+
+	return testToken
+}
+
+func getFakeRealmAccessToken(t *testing.T) jose.JWT {
+	testToken, err := jose.NewJWT(
+		jose.JOSEHeader{
+			"alg": "RS256",
+		},
+		jose.Claims{
+			"jti": "4ee75b8e-3ee6-4382-92d4-3390b4b4937b",
+			//"exp": "1450372969",
+			"nbf":            0,
+			"iat":            "1450372669",
+			"iss":            "https://keycloak.example.com/auth/realms/commons",
+			"aud":            "test",
+			"sub":            "1e11e539-8256-4b3b-bda8-cc0d56cddb48",
+			"typ":            "Bearer",
+			"azp":            "clientid",
+			"session_state":  "98f4c3d2-1b8c-4932-b8c4-92ec0ea7e195",
+			"client_session": "f0105893-369a-46bc-9661-ad8c747b1a69",
+			"realm_access": map[string]interface{}{
+				"roles": []string{
+					"dsp-dev-vpn",
+					"vpn-user",
+					"dsp-prod-vpn",
+				},
+			},
+			"resource_access": map[string]interface{}{
+				"openvpn": map[string]interface{}{
+					"roles": []string{
+						"dev-vpn",
+					},
+				},
+			},
+			"email":              "gambol99@gmail.com",
+			"name":               "Rohith Jayawardene",
+			"family_name":        "Jayawardene",
+			"preferred_username": "rjayawardene",
+			"given_name":         "Rohith",
+		},
+	)
+	if err != nil {
+		t.Fatalf("unable to generate a token: %s", err)
+	}
+
+	return testToken
+}
 
 func TestIsAudience(t *testing.T) {
 	user := &userContext{
 		audience: "test",
 	}
 	if !user.isAudience("test") {
-		t.Errorf("return should not have been false")
+		t.Error("return should not have been false")
 	}
 	if user.isAudience("test1") {
-		t.Errorf("return should not have been true")
+		t.Error("return should not have been true")
 	}
 }
 
@@ -37,10 +120,10 @@ func TestGetUserRoles(t *testing.T) {
 		roles: []string{"1", "2", "3"},
 	}
 	if user.getRoles() != "1,2,3" {
-		t.Errorf("we should have received a true resposne")
+		t.Error("we should have received a true resposne")
 	}
 	if user.getRoles() == "nothing" {
-		t.Errorf("we should have recieved a false response")
+		t.Error("we should have recieved a false response")
 	}
 }
 
@@ -49,7 +132,7 @@ func TestIsExpired(t *testing.T) {
 		expiresAt: time.Now(),
 	}
 	if !user.isExpired() {
-		t.Errorf("we should have been false")
+		t.Error("we should have been false")
 	}
 }
 
@@ -57,7 +140,45 @@ func TestIsBearerToken(t *testing.T) {
 	user := &userContext{
 		bearerToken: true,
 	}
-	if !user.isBearerToken() {
-		t.Errorf("the bearer token should have been true")
+	assert.True(t, user.isBearer())
+	assert.False(t, user.isCookie())
+}
+
+func TestIsCookie(t *testing.T) {
+	user := &userContext{
+		bearerToken: false,
 	}
+	assert.False(t, user.isBearer())
+	assert.True(t, user.isCookie())
+}
+
+func TestGetUserContext(t *testing.T) {
+	roles := []string{"openvpn:dev-vpn"}
+
+	context, err := extractIdentity(newFakeAccessToken())
+	assert.NoError(t, err)
+	assert.NotNil(t, context)
+	assert.Equal(t, "1e11e539-8256-4b3b-bda8-cc0d56cddb48", context.id)
+	assert.Equal(t, "gambol99@gmail.com", context.email)
+	assert.Equal(t, "rjayawardene", context.preferredName)
+	assert.Equal(t, roles, context.roles)
+}
+
+func BenchmarkExtractIdentity(b *testing.B) {
+	token := newFakeAccessToken()
+	for n := 0; n < b.N; n++ {
+		extractIdentity(token)
+	}
+}
+
+func TestGetUserRealmRoleContext(t *testing.T) {
+	roles := []string{"dsp-dev-vpn", "vpn-user", "dsp-prod-vpn", "openvpn:dev-vpn"}
+
+	context, err := extractIdentity(getFakeRealmAccessToken(t))
+	assert.NoError(t, err)
+	assert.NotNil(t, context)
+	assert.Equal(t, "1e11e539-8256-4b3b-bda8-cc0d56cddb48", context.id)
+	assert.Equal(t, "gambol99@gmail.com", context.email)
+	assert.Equal(t, "rjayawardene", context.preferredName)
+	assert.Equal(t, roles, context.roles)
 }

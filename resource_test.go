@@ -17,7 +17,69 @@ package main
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
+
+func TestDecodeResource(t *testing.T) {
+	testCases := []struct {
+		Option   string
+		Ok       bool
+		Resource *Resource
+	}{
+		{
+			Option: "uri=/admin",
+			Ok:     true,
+			Resource: &Resource{
+				URL: "/admin",
+			},
+		},
+		{
+			Option: "uri=/",
+			Ok:     true,
+			Resource: &Resource{
+				URL: "/",
+			},
+		},
+		{
+			Option: "uri=/admin/sso|roles=test,test1",
+			Ok:     true,
+			Resource: &Resource{
+				URL:   "/admin/sso",
+				Roles: []string{"test", "test1"},
+			},
+		},
+		{
+			Option: "uri=/admin/sso|roles=test,test1|methods=GET,POST",
+			Ok:     true,
+			Resource: &Resource{
+				URL:     "/admin/sso",
+				Roles:   []string{"test", "test1"},
+				Methods: []string{"GET", "POST"},
+			},
+		},
+		{
+			Option: "uri=/allow_me|white-listed=true",
+			Ok:     true,
+			Resource: &Resource{
+				URL:         "/allow_me",
+				WhiteListed: true,
+			},
+		},
+		{
+			Option: "",
+		},
+	}
+
+	for i, c := range testCases {
+		rc, err := newResource().parse(c.Option)
+		if c.Ok && err != nil {
+			t.Errorf("test case %d should not have failed, error: %s", i, err)
+			continue
+		}
+		assert.Equal(t, rc, c.Resource)
+	}
+}
 
 func TestIsValid(t *testing.T) {
 	testCases := []struct {
@@ -47,7 +109,7 @@ func TestIsValid(t *testing.T) {
 	}
 
 	for i, c := range testCases {
-		err := c.Resource.isValid()
+		err := c.Resource.valid()
 		if err != nil && c.Ok {
 			t.Errorf("case %d should not have failed", i)
 		}
@@ -59,7 +121,7 @@ func TestResourceString(t *testing.T) {
 		Roles: []string{"1", "2", "3"},
 	}
 	if s := resource.String(); s == "" {
-		t.Errorf("we should have recieved a string")
+		t.Error("we should have recieved a string")
 	}
 }
 

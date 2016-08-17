@@ -16,55 +16,12 @@ limitations under the License.
 package main
 
 import (
-	"io/ioutil"
-	"os"
 	"testing"
-
-	"github.com/codegangsta/cli"
 )
 
 func TestNewDefaultConfig(t *testing.T) {
 	if config := newDefaultConfig(); config == nil {
-		t.Errorf("we should have recieved a config")
-	}
-}
-
-func TestReadConfiguration(t *testing.T) {
-	testCases := []struct {
-		Content string
-		Ok      bool
-	}{
-		{
-			Content: `
-discovery_url: https://keyclock.domain.com/
-clientid: <client_id>
-secret: <secret>
-`,
-		},
-		{
-			Content: `
-discovery_url: https://keyclock.domain.com
-clientid: <client_id>
-secret: <secret>
-upstream: http://127.0.0.1:8080
-redirection_url: http://127.0.0.1:3000
-`,
-			Ok: true,
-		},
-	}
-
-	for i, test := range testCases {
-		// step: write the fake config file
-		file := writeFakeConfigFile(t, test.Content)
-		defer func(f *os.File) {
-			os.Remove(f.Name())
-		}(file)
-
-		config := new(Config)
-		err := readConfigFile(file.Name(), config)
-		if test.Ok && err != nil {
-			t.Errorf("test case %d should not have failed, config: %v, error: %s", i, config, err)
-		}
+		t.Error("we should have recieved a config")
 	}
 }
 
@@ -85,7 +42,7 @@ func TestIsConfig(t *testing.T) {
 			Config: &Config{
 				DiscoveryURL: "http://127.0.0.1:8080",
 				ClientID:     "client",
-				Secret:       "client",
+				ClientSecret: "client",
 			},
 		},
 		{
@@ -93,7 +50,7 @@ func TestIsConfig(t *testing.T) {
 				Listen:         ":8080",
 				DiscoveryURL:   "http://127.0.0.1:8080",
 				ClientID:       "client",
-				Secret:         "client",
+				ClientSecret:   "client",
 				RedirectionURL: "http://120.0.0.1",
 			},
 		},
@@ -102,7 +59,7 @@ func TestIsConfig(t *testing.T) {
 				Listen:         ":8080",
 				DiscoveryURL:   "http://127.0.0.1:8080",
 				ClientID:       "client",
-				Secret:         "client",
+				ClientSecret:   "client",
 				RedirectionURL: "http://120.0.0.1",
 				Upstream:       "http://120.0.0.1",
 			},
@@ -113,10 +70,10 @@ func TestIsConfig(t *testing.T) {
 				Listen:         ":8080",
 				DiscoveryURL:   "http://127.0.0.1:8080",
 				ClientID:       "client",
-				Secret:         "client",
+				ClientSecret:   "client",
 				RedirectionURL: "http://120.0.0.1",
 				Upstream:       "http://120.0.0.1",
-				ClaimsMatch: map[string]string{
+				MatchClaims: map[string]string{
 					"test": "&&&[",
 				},
 			},
@@ -133,7 +90,7 @@ func TestIsConfig(t *testing.T) {
 			Config: &Config{
 				DiscoveryURL:   "http://127.0.0.1:8080",
 				ClientID:       "client",
-				Secret:         "client",
+				ClientSecret:   "client",
 				RedirectionURL: "http://120.0.0.1",
 				Upstream:       "http://120.0.0.1",
 			},
@@ -143,7 +100,7 @@ func TestIsConfig(t *testing.T) {
 				Listen:         ":8080",
 				DiscoveryURL:   "http://127.0.0.1:8080",
 				ClientID:       "client",
-				Secret:         "client",
+				ClientSecret:   "client",
 				RedirectionURL: "http://120.0.0.1",
 			},
 		},
@@ -152,10 +109,33 @@ func TestIsConfig(t *testing.T) {
 				Listen:         ":8080",
 				DiscoveryURL:   "http://127.0.0.1:8080",
 				ClientID:       "client",
-				Secret:         "client",
+				ClientSecret:   "client",
 				RedirectionURL: "http://120.0.0.1",
 				Upstream:       "this should fail",
 			},
+		},
+		{
+			Config: &Config{
+				Listen:         ":8080",
+				DiscoveryURL:   "http://127.0.0.1:8080",
+				ClientID:       "client",
+				ClientSecret:   "client",
+				RedirectionURL: "http://120.0.0.1",
+				Upstream:       "this should fail",
+				SecureCookie:   true,
+			},
+		},
+		{
+			Config: &Config{
+				Listen:         ":8080",
+				DiscoveryURL:   "http://127.0.0.1:8080",
+				ClientID:       "client",
+				ClientSecret:   "client",
+				RedirectionURL: "https://120.0.0.1",
+				Upstream:       "this should fail",
+				SecureCookie:   true,
+			},
+			Ok: true,
 		},
 	}
 
@@ -164,33 +144,4 @@ func TestIsConfig(t *testing.T) {
 			t.Errorf("test case %d, the config should not have errored, error: %s", i, err)
 		}
 	}
-}
-
-func TestReadOptions(t *testing.T) {
-	c := cli.NewApp()
-	c.Flags = getOptions()
-	c.Action = func(cx *cli.Context) {
-		readOptions(cx, &Config{})
-	}
-	c.Run([]string{""})
-}
-
-func TestGetOptions(t *testing.T) {
-	if flags := getOptions(); flags == nil {
-		t.Errorf("we should have received some flags options")
-	}
-}
-
-func writeFakeConfigFile(t *testing.T, content string) *os.File {
-	f, err := ioutil.TempFile("", "node_label_file")
-	if err != nil {
-		t.Fatalf("unexpected error creating node_label_file: %v", err)
-	}
-	f.Close()
-
-	if err := ioutil.WriteFile(f.Name(), []byte(content), 0700); err != nil {
-		t.Fatalf("unexpected error writing node label file: %v", err)
-	}
-
-	return f
 }

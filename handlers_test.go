@@ -16,387 +16,19 @@ limitations under the License.
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
-	"strings"
+	"net/url"
 	"testing"
 	"time"
 
 	"github.com/coreos/go-oidc/jose"
-	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 )
 
-func TestEntrypointHandlerSecure(t *testing.T) {
-	proxy := newFakeKeycloakProxyWithResources(t, []*Resource{
-		{
-			URL:         "/admin/white_listed",
-			WhiteListed: true,
-		},
-		{
-			URL:     "/admin",
-			Methods: []string{"ANY"},
-		},
-		{
-			URL:     "/",
-			Methods: []string{"POST"},
-			Roles:   []string{"test"},
-		},
-	})
-
-	handler := proxy.entryPointHandler()
-
-	tests := []struct {
-		Context *gin.Context
-		Secure  bool
-	}{
-		{Context: newFakeGinContext("GET", "/")},
-		{Context: newFakeGinContext("GET", "/admin"), Secure: true},
-		{Context: newFakeGinContext("GET", "/admin/white_listed")},
-		{Context: newFakeGinContext("GET", "/admin/white"), Secure: true},
-		{Context: newFakeGinContext("GET", "/not_secure")},
-		{Context: newFakeGinContext("POST", "/"), Secure: true},
-	}
-
-	for i, c := range tests {
-		handler(c.Context)
-		_, found := c.Context.Get(cxEnforce)
-		if c.Secure && !found {
-			t.Errorf("test case %d should have been set secure", i)
-		}
-		if !c.Secure && found {
-			t.Errorf("test case %d should not have been set secure", i)
-		}
-	}
-}
-
-func TestEntrypointMethods(t *testing.T) {
-	proxy := newFakeKeycloakProxyWithResources(t, []*Resource{
-		{
-			URL:     "/u0",
-			Methods: []string{"GET", "POST"},
-		},
-		{
-			URL:     "/u1",
-			Methods: []string{"ANY"},
-		},
-		{
-			URL:     "/u2",
-			Methods: []string{"POST", "PUT"},
-		},
-	})
-
-	handler := proxy.entryPointHandler()
-
-	tests := []struct {
-		Context *gin.Context
-		Secure  bool
-	}{
-		{Context: newFakeGinContext("GET", "/u0"), Secure: true},
-		{Context: newFakeGinContext("POST", "/u0"), Secure: true},
-		{Context: newFakeGinContext("PUT", "/u0"), Secure: false},
-		{Context: newFakeGinContext("GET", "/u1"), Secure: true},
-		{Context: newFakeGinContext("POST", "/u1"), Secure: true},
-		{Context: newFakeGinContext("PATCH", "/u1"), Secure: true},
-		{Context: newFakeGinContext("POST", "/u2"), Secure: true},
-		{Context: newFakeGinContext("PUT", "/u2"), Secure: true},
-		{Context: newFakeGinContext("DELETE", "/u2"), Secure: false},
-	}
-
-	for i, c := range tests {
-		handler(c.Context)
-		_, found := c.Context.Get(cxEnforce)
-		if c.Secure && !found {
-			t.Errorf("test case %d should have been set secure", i)
-		}
-		if !c.Secure && found {
-			t.Errorf("test case %d should not have been set secure", i)
-		}
-	}
-}
-
-func TestEntrypointWhiteListing(t *testing.T) {
-	proxy := newFakeKeycloakProxyWithResources(t, []*Resource{
-		{
-			URL:         "/admin/white_listed",
-			WhiteListed: true,
-		},
-		{
-			URL:     "/admin",
-			Methods: []string{"ANY"},
-		},
-	})
-	handler := proxy.entryPointHandler()
-
-	tests := []struct {
-		Context *gin.Context
-		Secure  bool
-	}{
-		{Context: newFakeGinContext("GET", "/")},
-		{Context: newFakeGinContext("GET", "/admin"), Secure: true},
-		{Context: newFakeGinContext("GET", "/admin/white_listed")},
-	}
-
-	for i, c := range tests {
-		handler(c.Context)
-		_, found := c.Context.Get(cxEnforce)
-		if c.Secure && !found {
-			t.Errorf("test case %d should have been set secure", i)
-		}
-		if !c.Secure && found {
-			t.Errorf("test case %d should not have been set secure", i)
-		}
-	}
-
-}
-
-func TestEntrypointHandler(t *testing.T) {
-	proxy := newFakeKeycloakProxy(t)
-	handler := proxy.entryPointHandler()
-
-	tests := []struct {
-		Context *gin.Context
-		Secure  bool
-	}{
-		{Context: newFakeGinContext("GET", fakeAdminRoleURL), Secure: true},
-		{Context: newFakeGinContext("GET", fakeAdminRoleURL+"/sso"), Secure: true},
-		{Context: newFakeGinContext("GET", fakeAdminRoleURL+"/../sso"), Secure: true},
-		{Context: newFakeGinContext("GET", "/not_secure")},
-		{Context: newFakeGinContext("GET", fakeTestWhitelistedURL)},
-		{Context: newFakeGinContext("GET", oauthURL)},
-		{Context: newFakeGinContext("GET", faketestListenOrdered), Secure: true},
-	}
-
-	for i, c := range tests {
-		handler(c.Context)
-		_, found := c.Context.Get(cxEnforce)
-		if c.Secure && !found {
-			t.Errorf("test case %d should have been set secure", i)
-		}
-		if !c.Secure && found {
-			t.Errorf("test case %d should not have been set secure", i)
-		}
-	}
-}
-
-func TestAdmissionHandlerRoles(t *testing.T) {
-	proxy := newFakeKeycloakProxyWithResources(t, []*Resource{
-		{
-			URL:     "/admin",
-			Methods: []string{"ANY"},
-			Roles:   []string{"admin"},
-		},
-		{
-			URL:     "/test",
-			Methods: []string{"GET"},
-			Roles:   []string{"test"},
-		},
-		{
-			URL:     "/either",
-			Methods: []string{"ANY"},
-			Roles:   []string{"admin", "test"},
-		},
-		{
-			URL:     "/",
-			Methods: []string{"ANY"},
-		},
-	})
-	handler := proxy.admissionHandler()
-
-	tests := []struct {
-		Context     *gin.Context
-		UserContext *userContext
-		HTTPCode    int
-	}{
-		{
-			Context:     newFakeGinContext("GET", "/admin"),
-			UserContext: &userContext{},
-			HTTPCode:    http.StatusForbidden,
-		},
-		{
-			Context:  newFakeGinContext("GET", "/admin"),
-			HTTPCode: http.StatusOK,
-			UserContext: &userContext{
-				roles: []string{"admin"},
-			},
-		},
-		{
-			Context:  newFakeGinContext("GET", "/test"),
-			HTTPCode: http.StatusOK,
-			UserContext: &userContext{
-				roles: []string{"test"},
-			},
-		},
-		{
-			Context:  newFakeGinContext("GET", "/either"),
-			HTTPCode: http.StatusOK,
-			UserContext: &userContext{
-				roles: []string{"test", "admin"},
-			},
-		},
-		{
-			Context:  newFakeGinContext("GET", "/either"),
-			HTTPCode: http.StatusForbidden,
-			UserContext: &userContext{
-				roles: []string{"no_roles"},
-			},
-		},
-		{
-			Context:     newFakeGinContext("GET", "/"),
-			HTTPCode:    http.StatusOK,
-			UserContext: &userContext{},
-		},
-	}
-
-	for i, c := range tests {
-		// step: find the resource and inject into the context
-		for _, r := range proxy.config.Resources {
-			if strings.HasPrefix(c.Context.Request.URL.Path, r.URL) {
-				c.Context.Set(cxEnforce, r)
-				break
-			}
-		}
-		if _, found := c.Context.Get(cxEnforce); !found {
-			t.Errorf("test case %d unable to find a resource for context", i)
-			continue
-		}
-
-		c.Context.Set(userContextName, c.UserContext)
-
-		handler(c.Context)
-		if c.Context.Writer.Status() != c.HTTPCode {
-			t.Errorf("test case %d should have recieved code: %d, got %d", i, c.HTTPCode, c.Context.Writer.Status())
-		}
-	}
-}
-
-func TestAdmissionHandlerClaims(t *testing.T) {
-	// allow any fake authed users
-	proxy := newFakeKeycloakProxyWithResources(t, []*Resource{
-		{
-			URL:     "/admin",
-			Methods: []string{"ANY"},
-		},
-	})
-
-	tests := []struct {
-		Matches     map[string]string
-		Context     *gin.Context
-		UserContext *userContext
-		HTTPCode    int
-	}{
-		{
-			Matches: map[string]string{"iss": "test"},
-			Context: newFakeGinContext("GET", "/admin"),
-			UserContext: &userContext{
-				claims: jose.Claims{},
-			},
-			HTTPCode: http.StatusForbidden,
-		},
-		{
-			Matches: map[string]string{"iss": "^tes$"},
-			Context: newFakeGinContext("GET", "/admin"),
-			UserContext: &userContext{
-				claims: jose.Claims{"iss": 1},
-			},
-			HTTPCode: http.StatusForbidden,
-		},
-		{
-			Matches: map[string]string{"iss": "^tes$"},
-			Context: newFakeGinContext("GET", "/admin"),
-			UserContext: &userContext{
-				claims: jose.Claims{"iss": "bad_match"},
-			},
-			HTTPCode: http.StatusForbidden,
-		},
-		{
-			Matches: map[string]string{"iss": "^test", "notfound": "someting"},
-			Context: newFakeGinContext("GET", "/admin"),
-			UserContext: &userContext{
-				claims: jose.Claims{"iss": "test"},
-			},
-			HTTPCode: http.StatusForbidden,
-		},
-		{
-			Matches: map[string]string{"iss": "^test", "notfound": "someting"},
-			Context: newFakeGinContext("GET", "/admin"),
-			UserContext: &userContext{
-				claims: jose.Claims{"iss": "test"},
-			},
-			HTTPCode: http.StatusForbidden,
-		},
-		{
-			Matches: map[string]string{"iss": ".*"},
-			Context: newFakeGinContext("GET", "/admin"),
-			UserContext: &userContext{
-				claims: jose.Claims{"iss": "test"},
-			},
-			HTTPCode: http.StatusOK,
-		},
-		{
-			Matches: map[string]string{"iss": "^t.*$"},
-			Context: newFakeGinContext("GET", "/admin"),
-			UserContext: &userContext{
-				claims: jose.Claims{"iss": "test"},
-			},
-			HTTPCode: http.StatusOK,
-		},
-	}
-
-	for i, c := range tests {
-		// step: if closure so we need to get the handler each time
-		proxy.config.ClaimsMatch = c.Matches
-		handler := proxy.admissionHandler()
-		// step: inject a resource
-
-		c.Context.Set(cxEnforce, proxy.config.Resources[0])
-		c.Context.Set(userContextName, c.UserContext)
-
-		handler(c.Context)
-		if c.Context.Writer.Status() != c.HTTPCode {
-			t.Errorf("test case %d should have recieved code: %d, got %d", i, c.HTTPCode, c.Context.Writer.Status())
-		}
-	}
-}
-
-func TestSecurityHandler(t *testing.T) {
-	kc := newFakeKeycloakProxy(t)
-	handler := kc.securityHandler()
-	context := newFakeGinContext("GET", "/")
-	handler(context)
-	if context.Writer.Status() != http.StatusOK {
-		t.Errorf("we should have received a 200")
-	}
-
-	kc = newFakeKeycloakProxy(t)
-	kc.config.Hostnames = []string{"127.0.0.1"}
-	handler = kc.securityHandler()
-	handler(context)
-	if context.Writer.Status() != http.StatusOK {
-		t.Errorf("we should have received a 200 not %d", context.Writer.Status())
-	}
-
-	kc = newFakeKeycloakProxy(t)
-	kc.config.Hostnames = []string{"127.0.0.2"}
-	handler = kc.securityHandler()
-	handler(context)
-	if context.Writer.Status() != http.StatusInternalServerError {
-		t.Errorf("we should have received a 500 not %d", context.Writer.Status())
-	}
-}
-
-func newFakeJWTToken(t *testing.T, claims jose.Claims) *jose.JWT {
-	token, err := jose.NewJWT(
-		jose.JOSEHeader{"alg": "RS256"}, claims,
-	)
-	if err != nil {
-		t.Fatalf("failed to create the jwt token, error: %s", err)
-	}
-
-	return &token
-}
-
 func TestExpirationHandler(t *testing.T) {
-	proxy := newFakeKeycloakProxy(t)
+	proxy, _, _ := newTestProxyService(nil)
 
 	cases := []struct {
 		Token    *jose.JWT
@@ -409,11 +41,12 @@ func TestExpirationHandler(t *testing.T) {
 			Token: newFakeJWTToken(t, jose.Claims{
 				"exp": float64(time.Now().Add(-24 * time.Hour).Unix()),
 			}),
-			HTTPCode: http.StatusInternalServerError,
+			HTTPCode: http.StatusUnauthorized,
 		},
 		{
 			Token: newFakeJWTToken(t, jose.Claims{
 				"exp":                float64(time.Now().Add(10 * time.Hour).Unix()),
+				"aud":                "test",
 				"iss":                "https://keycloak.example.com/auth/realms/commons",
 				"sub":                "1e11e539-8256-4b3b-bda8-cc0d56cddb48",
 				"email":              "gambol99@gmail.com",
@@ -425,13 +58,14 @@ func TestExpirationHandler(t *testing.T) {
 		{
 			Token: newFakeJWTToken(t, jose.Claims{
 				"exp":                float64(time.Now().Add(-24 * time.Hour).Unix()),
+				"aud":                "test",
 				"iss":                "https://keycloak.example.com/auth/realms/commons",
 				"sub":                "1e11e539-8256-4b3b-bda8-cc0d56cddb48",
 				"email":              "gambol99@gmail.com",
 				"name":               "Rohith Jayawardene",
 				"preferred_username": "rjayawardene",
 			}),
-			HTTPCode: http.StatusForbidden,
+			HTTPCode: http.StatusUnauthorized,
 		},
 	}
 
@@ -445,17 +79,188 @@ func TestExpirationHandler(t *testing.T) {
 		// step: if closure so we need to get the handler each time
 		proxy.expirationHandler(cx)
 		// step: check the content result
-		if cx.Writer.Status() != c.HTTPCode {
-			t.Errorf("test case %d should have recieved: %d, but got %d", i, c.HTTPCode, cx.Writer.Status())
+		assert.Equal(t, c.HTTPCode, cx.Writer.Status(), "test case %d should have recieved: %d, but got %d", i,
+			c.HTTPCode, cx.Writer.Status())
+	}
+}
+
+func TestLoginHandler(t *testing.T) {
+	_, _, u := newTestProxyService(nil)
+
+	cs := []struct {
+		Username     string
+		Password     string
+		ExpectedCode int
+	}{
+		{
+			Username:     "",
+			Password:     "",
+			ExpectedCode: http.StatusBadRequest,
+		},
+		{
+			Username:     "test",
+			Password:     "",
+			ExpectedCode: http.StatusBadRequest,
+		},
+		{
+			Username:     "",
+			Password:     "test",
+			ExpectedCode: http.StatusBadRequest,
+		},
+		{
+			Username:     "test",
+			Password:     "test",
+			ExpectedCode: http.StatusOK,
+		},
+	}
+
+	for i, x := range cs {
+		u := u + oauthURL + loginURL
+		values := url.Values{}
+		if x.Username != "" {
+			values.Add("username", x.Username)
 		}
+		if x.Password != "" {
+			values.Add("password", x.Password)
+		}
+
+		resp, err := http.PostForm(u, values)
+		if err != nil {
+			t.Errorf("case %d, unable to make requets, error: %s", i, err)
+			continue
+		}
+		assert.Equal(t, x.ExpectedCode, resp.StatusCode, "case %d, expect: %v, got: %d",
+			i, x.ExpectedCode, resp.StatusCode)
+	}
+}
+
+func TestTokenHandler(t *testing.T) {
+	token := newFakeAccessToken()
+	_, _, u := newTestProxyService(nil)
+	url := u + oauthURL + tokenURL
+
+	// step: get a request
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+token.Encode())
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	if err != nil {
+		t.Errorf("failed to make request, error: %s", err)
+		t.FailNow()
+	}
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	req, _ = http.NewRequest("GET", url, nil)
+	resp, err = http.DefaultTransport.RoundTrip(req)
+	if err != nil {
+		t.Errorf("failed to make request, error: %s", err)
+		t.FailNow()
+	}
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestAuthorizationURL(t *testing.T) {
+	_, _, u := newTestProxyService(nil)
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return errors.New("no redirect")
+		},
+	}
+	cs := []struct {
+		URL          string
+		ExpectedURL  string
+		ExpectedCode int
+	}{
+		{
+			URL:          "/",
+			ExpectedCode: http.StatusNotFound,
+		},
+		{
+			URL:          "/admin",
+			ExpectedURL:  "/oauth/authorize?state=L2FkbWlu",
+			ExpectedCode: http.StatusTemporaryRedirect,
+		},
+		{
+			URL:          "/admin/test",
+			ExpectedURL:  "/oauth/authorize?state=L2FkbWluL3Rlc3Q=",
+			ExpectedCode: http.StatusTemporaryRedirect,
+		},
+		{
+			URL:          "/admin/../",
+			ExpectedURL:  "/oauth/authorize?state=L2FkbWluLy4uLw==",
+			ExpectedCode: http.StatusTemporaryRedirect,
+		},
+		{
+			URL:          "/admin?test=yes&test1=test",
+			ExpectedURL:  "/oauth/authorize?state=L2FkbWluP3Rlc3Q9eWVzJnRlc3QxPXRlc3Q=",
+			ExpectedCode: http.StatusTemporaryRedirect,
+		},
+	}
+	for i, x := range cs {
+		resp, _ := client.Get(u + x.URL)
+		assert.Equal(t, x.ExpectedCode, resp.StatusCode, "case %d, expect: %v, got: %s", i, x.ExpectedCode, resp.StatusCode)
+		assert.Equal(t, x.ExpectedURL, resp.Header.Get("Location"), "case %d, expect: %v, got: %s", i, x.ExpectedURL, resp.Header.Get("Location"))
+	}
+}
+
+func TestCallbackURL(t *testing.T) {
+	_, _, u := newTestProxyService(nil)
+
+	cs := []struct {
+		URL         string
+		ExpectedURL string
+	}{
+		{
+			URL:         "/oauth/authorize?state=L2FkbWlu",
+			ExpectedURL: "/admin",
+		},
+		{
+			URL:         "/oauth/authorize",
+			ExpectedURL: "/",
+		},
+		{
+			URL:         "/oauth/authorize?state=L2FkbWluL3Rlc3QxP3Rlc3QxJmhlbGxv",
+			ExpectedURL: "/admin/test1?test1&hello",
+		},
+	}
+	for i, x := range cs {
+		// step: call the authorization endpoint
+		req, err := http.NewRequest("GET", u+x.URL, nil)
+		if err != nil {
+			continue
+		}
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		if !assert.NoError(t, err, "case %d, should not have failed", i) {
+			continue
+		}
+		openIDURL := resp.Header.Get("Location")
+		if !assert.NotEmpty(t, openIDURL, "case %d, the open id redirection url is empty", i) {
+			continue
+		}
+		req, _ = http.NewRequest("GET", openIDURL, nil)
+		resp, err = http.DefaultTransport.RoundTrip(req)
+		if !assert.NoError(t, err, "case %d, should not have failed calling the opend id url", i) {
+			continue
+		}
+		callbackURL := resp.Header.Get("Location")
+		if !assert.NotEmpty(t, callbackURL, "case %d, should have recieved a callback url", i) {
+			continue
+		}
+		// step: call the callback url
+		req, _ = http.NewRequest("GET", callbackURL, nil)
+		resp, err = http.DefaultTransport.RoundTrip(req)
+		if !assert.NoError(t, err, "case %d, unable to call the callback url", i) {
+			continue
+		}
+		// step: check the callback location is as expected
+		assert.Contains(t, resp.Header.Get("Location"), x.ExpectedURL)
 	}
 }
 
 func TestHealthHandler(t *testing.T) {
-	proxy := newFakeKeycloakProxy(t)
+	p, _, _ := newTestProxyService(nil)
 	context := newFakeGinContext("GET", healthURL)
-	proxy.healthHandler(context)
-	if context.Writer.Status() != http.StatusOK {
-		t.Errorf("we should have recieved a 200 response")
-	}
+	p.healthHandler(context)
+	assert.Equal(t, http.StatusOK, context.Writer.Status())
+	assert.NotEmpty(t, context.Writer.Header().Get(versionHeader))
+	assert.Equal(t, version, context.Writer.Header().Get(versionHeader))
 }

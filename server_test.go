@@ -21,10 +21,12 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 
 	log "github.com/Sirupsen/logrus"
+	"github.com/coreos/go-oidc/jose"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 )
@@ -38,27 +40,24 @@ const (
 	fakeTestAdminRolesURL  = "/test_admin_roles"
 	fakeAuthAllURL         = "/auth_all"
 	fakeTestWhitelistedURL = fakeAuthAllURL + "/white_listed"
-	faketestListenOrdered  = fakeAuthAllURL + "/bad_order"
+	fakeTestListenOrdered  = fakeAuthAllURL + "/bad_order"
 
 	fakeAdminRole = "role:admin"
 	fakeTestRole  = "role:test"
 )
 
-func newFakeKeycloakProxyWithResources(t *testing.T, resources []*Resource) *keycloakProxy {
-	kc := newFakeKeycloakProxy(t)
-	kc.config.Resources = resources
-	return kc
-}
-
-func newFakeKeycloakConfig(t *testing.T) *Config {
+func newFakeKeycloakConfig() *Config {
 	return &Config{
-		DiscoveryURL:          "127.0.0.1:",
+		DiscoveryURL:          "127.0.0.1:8080",
 		ClientID:              fakeClientID,
-		Secret:                fakeSecret,
+		ClientSecret:          fakeSecret,
 		EncryptionKey:         "AgXa7xRcoClDEU0ZDSH4X0XhL5Qy2Z2j",
 		SkipTokenVerification: true,
 		Scopes:                []string{},
-		RefreshSessions:       false,
+		EnableRefreshTokens:   false,
+		SecureCookie:          false,
+		CookieAccessName:      "kc-access",
+		CookieRefreshName:     "kc-state",
 		Resources: []*Resource{
 			{
 				URL:     fakeAdminRoleURL,
@@ -93,97 +92,64 @@ func newFakeKeycloakConfig(t *testing.T) *Config {
 				Roles:       []string{},
 			},
 		},
-		CORS: &CORS{},
+		CrossOrigin: CORS{},
 	}
 }
 
-func newFakeKeycloakProxy(t *testing.T) *keycloakProxy {
+func newTestProxyService(config *Config) (*oauthProxy, *fakeOAuthServer, string) {
 	log.SetOutput(ioutil.Discard)
 
-	kc := &keycloakProxy{
-		config: newFakeKeycloakConfig(t),
-		proxy:  new(fakeReverseProxy),
-	}
-	kc.router = gin.New()
-	gin.SetMode(gin.ReleaseMode)
-	// step: add the gin routing
-	kc.initializeRouter()
+	// step: create a fake oauth server
+	auth := newFakeOAuthServer()
 
-	return kc
+	// step: use the default config if required
+	if config == nil {
+		config = newFakeKeycloakConfig()
+	}
+
+	// step: set the config
+	config.LogRequests = true
+	config.SkipTokenVerification = false
+	config.DiscoveryURL = auth.getLocation()
+	config.Verbose = false
+
+	// step: create a proxy
+	proxy, err := newProxy(config)
+	if err != nil {
+		panic("failed to create proxy service, error: " + err.Error())
+	}
+
+	// step: create an fake upstream endpoint
+	proxy.upstream = new(fakeReverseProxy)
+	service := httptest.NewServer(proxy.router)
+	config.RedirectionURL = service.URL
+
+	// step: we need to update the client config
+	proxy.client, proxy.provider, err = createOpenIDClient(config)
+	if err != nil {
+		panic("failed to recreate the openid client, error: " + err.Error())
+	}
+
+	return proxy, auth, service.URL
+}
+
+func newFakeKeycloakProxyWithResources(t *testing.T, resources []*Resource) *oauthProxy {
+	p, _, _ := newTestProxyService(nil)
+	p.config.Resources = resources
+	p.endpoint = &url.URL{
+		Host: "127.0.0.1",
+	}
+
+	return p
 }
 
 func TestNewKeycloakProxy(t *testing.T) {
-	proxy, err := newKeycloakProxy(newFakeKeycloakConfig(t))
+	proxy, err := newProxy(newFakeKeycloakConfig())
 	assert.NoError(t, err)
 	assert.NotNil(t, proxy)
 	assert.NotNil(t, proxy.config)
 	assert.NotNil(t, proxy.router)
-	assert.NotNil(t, proxy.upstreamURL)
-}
-
-func TestRedirectToAuthorization(t *testing.T) {
-	context := newFakeGinContext("GET", "/admin")
-	proxy := newFakeKeycloakProxy(t)
-
-	proxy.config.SkipTokenVerification = false
-	proxy.redirectToAuthorization(context)
-	assert.Equal(t, http.StatusTemporaryRedirect, context.Writer.Status())
-}
-
-func TestRedirectToAuthorizationSkipToken(t *testing.T) {
-	context := newFakeGinContext("GET", "/admin")
-	proxy := newFakeKeycloakProxy(t)
-
-	proxy.config.SkipTokenVerification = true
-	proxy.redirectToAuthorization(context)
-	assert.Equal(t, http.StatusForbidden, context.Writer.Status())
-}
-
-func TestRedirectToAuthorizationUnauthorized(t *testing.T) {
-	context := newFakeGinContext("GET", "/admin")
-	proxy := newFakeKeycloakProxy(t)
-	proxy.config.SkipTokenVerification = false
-	proxy.config.NoRedirects = true
-
-	proxy.redirectToAuthorization(context)
-	assert.Equal(t, http.StatusUnauthorized, context.Writer.Status())
-}
-
-func TestInitializeReverseProxy(t *testing.T) {
-	proxy := newFakeKeycloakProxy(t)
-
-	uri, _ := url.Parse("http://127.0.0.1:8080")
-	reverse, err := proxy.initializeReverseProxy(uri)
-	assert.NoError(t, err)
-	assert.NotNil(t, reverse)
-}
-
-func TestRedirectURL(t *testing.T) {
-	context := newFakeGinContext("GET", "/admin")
-	proxy := newFakeKeycloakProxy(t)
-
-	if proxy.redirectToURL("http://127.0.0.1", context); context.Writer.Status() != http.StatusTemporaryRedirect {
-		t.Errorf("we should have recieved a redirect")
-	}
-
-	if !context.IsAborted() {
-		t.Errorf("the context should have been aborted")
-	}
-}
-
-func TestAccessForbidden(t *testing.T) {
-	context := newFakeGinContext("GET", "/admin")
-	proxy := newFakeKeycloakProxy(t)
-
-	proxy.config.SkipTokenVerification = false
-	if proxy.accessForbidden(context); context.Writer.Status() != http.StatusForbidden {
-		t.Errorf("we should have recieved a forbidden access")
-	}
-
-	proxy.config.SkipTokenVerification = true
-	if proxy.accessForbidden(context); context.Writer.Status() != http.StatusForbidden {
-		t.Errorf("we should have recieved a forbidden access")
-	}
+	assert.NotNil(t, proxy.endpoint)
 }
 
 func newFakeResponse() *fakeResponse {
@@ -195,7 +161,6 @@ func newFakeResponse() *fakeResponse {
 
 func newFakeGinContext(method, uri string) *gin.Context {
 	return &gin.Context{
-
 		Request: &http.Request{
 			Method:     method,
 			Host:       "127.0.0.1",
@@ -212,6 +177,26 @@ func newFakeGinContext(method, uri string) *gin.Context {
 	}
 }
 
+func newFakeGinContextWithCookies(method, url string, cookies []*http.Cookie) *gin.Context {
+	cx := newFakeGinContext(method, url)
+	for _, x := range cookies {
+		cx.Request.AddCookie(x)
+	}
+
+	return cx
+}
+
+func newFakeJWTToken(t *testing.T, claims jose.Claims) *jose.JWT {
+	token, err := jose.NewJWT(
+		jose.JOSEHeader{"alg": "RS256"}, claims,
+	)
+	if err != nil {
+		t.Fatalf("failed to create the jwt token, error: %s", err)
+	}
+
+	return &token
+}
+
 type fakeReverseProxy struct{}
 
 func (r fakeReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {}
@@ -221,15 +206,19 @@ type fakeResponse struct {
 	status  int
 	headers http.Header
 	body    bytes.Buffer
+	written bool
 }
 
-func (r *fakeResponse) Flush()                                       {}
-func (r *fakeResponse) Written() bool                                { return false }
-func (r *fakeResponse) WriteHeaderNow()                              {}
-func (r *fakeResponse) Size() int                                    { return r.size }
-func (r *fakeResponse) Status() int                                  { return r.status }
-func (r *fakeResponse) Header() http.Header                          { return r.headers }
-func (r *fakeResponse) WriteHeader(code int)                         { r.status = code }
+func (r *fakeResponse) Flush()              {}
+func (r *fakeResponse) Written() bool       { return r.written }
+func (r *fakeResponse) WriteHeaderNow()     {}
+func (r *fakeResponse) Size() int           { return r.size }
+func (r *fakeResponse) Status() int         { return r.status }
+func (r *fakeResponse) Header() http.Header { return r.headers }
+func (r *fakeResponse) WriteHeader(code int) {
+	r.status = code
+	r.written = true
+}
 func (r *fakeResponse) Write(content []byte) (int, error)            { return len(content), nil }
 func (r *fakeResponse) WriteString(s string) (int, error)            { return len(s), nil }
 func (r *fakeResponse) Hijack() (net.Conn, *bufio.ReadWriter, error) { return nil, nil, nil }

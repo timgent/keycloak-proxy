@@ -1,16 +1,18 @@
-
 NAME=keycloak-proxy
 AUTHOR=gambol99
-HARDWARE=$(shell uname -m)
-REGISTRY=docker.io
-GOVERSION=1.6.0
-SUDO=sudo
-GIT_COMMIT=$(shell git log --pretty=format:'%h' -n 1)
+AUTHOR_EMAIL=gambol99@gmail.com
+REGISTRY=quay.io
+GOVERSION=1.6.2
+SUDO=
 ROOT_DIR=${PWD}
-VERSION=$(shell awk '/version.*=/ { print $$3 }' doc.go | sed 's/"//g')
+HARDWARE=$(shell uname -m)
+GIT_SHA=$(shell git --no-pager describe --always --dirty)
+BUILD_TIME=$(shell date -u '+%Y-%m-%d_%I:%M:%S%p')
+VERSION ?= $(shell awk '/release.*=/ { print $$3 }' doc.go | sed 's/"//g')
 DEPS=$(shell go list -f '{{range .TestImports}}{{.}} {{end}}' ./...)
 PACKAGES=$(shell go list ./...)
-VETARGS?=-asmdecl -atomic -bool -buildtags -copylocks -methods -nilfunc -printf -rangeloops -shift -structtags -unsafeptr
+LFLAGS ?= -X main.gitsha=${GIT_SHA}
+VETARGS ?= -asmdecl -atomic -bool -buildtags -copylocks -methods -nilfunc -printf -rangeloops -shift -structtags -unsafeptr
 
 .PHONY: test authors changelog build docker static release lint cover vet
 
@@ -20,28 +22,55 @@ golang:
 	@echo "--> Go Version"
 	@go version
 
+version:
+	@sed -i "s/const gitSHA =.*/const gitSHA = \"${GIT_SHA}\"/" doc.go
+
 build:
 	@echo "--> Compiling the project"
 	mkdir -p bin
-	godep go build -o bin/${NAME}
+	godep go build -ldflags "${LFLAGS}" -o bin/${NAME}
 
 static: golang deps
 	@echo "--> Compiling the static binary"
 	mkdir -p bin
-	CGO_ENABLED=0 GOOS=linux godep go build -a -tags netgo -ldflags '-w' -o bin/${NAME}
+	CGO_ENABLED=0 GOOS=linux godep go build -a -tags netgo -ldflags "-w ${LFLAGS}" -o bin/${NAME}
 
 docker-build:
 	@echo "--> Compiling the project"
 	${SUDO} docker run --rm -v ${ROOT_DIR}:/go/src/github.com/gambol99/keycloak-proxy \
 		-w /go/src/github.com/gambol99/keycloak-proxy -e GOOS=linux golang:${GOVERSION} make static
 
+docker-test:
+	@echo "--> Running the docker test"
+	${SUDO} docker run --rm -ti -p 3000:3000 \
+	    -v ${ROOT_DIR}/config.yml:/etc/keycloak/config.yml:ro \
+	    -v ${ROOT_DIR}/tests:/opt/tests:ro \
+	    ${REGISTRY}/${AUTHOR}/${NAME}:${VERSION} --config /etc/keycloak/config.yml
+
 docker:
 	@echo "--> Building the docker image"
 	${SUDO} docker build -t ${REGISTRY}/${AUTHOR}/${NAME}:${VERSION} .
 
+docker-release:
+	@echo "--> Building a release image"
+	@make static
+	@make docker
+	@docker push ${REGISTRY}/${AUTHOR}/${NAME}:${VERSION}
+
 docker-push:
 	@echo "--> Pushing the docker images to the registry"
 	${SUDO} docker push ${REGISTRY}/${AUTHOR}/${NAME}:${VERSION}
+
+certs:
+	@echo "--> Generating the root CA"
+	@cfssl gencert -initca tests/ca-csr.json | cfssljson -bare tests/ca
+	@echo "--> Generating the Test Certs"
+	cfssl gencert \
+		-ca=tests/ca.pem \
+		-ca-key=tests/ca-key.pem \
+		-config=tests/ca-config.json \
+		-profile=server \
+		tests/proxy-csr.json | cfssljson -bare tests/proxy
 
 release: static
 	mkdir -p release
@@ -86,6 +115,10 @@ gofmt:
 format:
 	@echo "--> Running go fmt"
 	@gofmt -s -w *.go
+
+bench:
+	@echo "--> Running go bench"
+	@godep go test -v -bench=.
 
 coverage:
 	@echo "--> Running go coverage"

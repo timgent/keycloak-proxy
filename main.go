@@ -16,58 +16,10 @@ limitations under the License.
 package main
 
 import (
-	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
-
-	"github.com/codegangsta/cli"
 )
 
 func main() {
-	config := newDefaultConfig()
-	kc := cli.NewApp()
-	kc.Name = prog
-	kc.Usage = description
-	kc.Version = version
-	kc.Author = author
-	kc.Email = email
-	kc.Flags = getOptions()
-	kc.Action = func(cx *cli.Context) {
-		// step: do we have a configuration file?
-		if filename := cx.String("config"); filename != "" {
-			if err := readConfigFile(cx.String("config"), config); err != nil {
-				printUsage(err.Error())
-			}
-		}
-		// step: parse the command line options
-		if err := readOptions(cx, config); err != nil {
-			printUsage(err.Error())
-		}
-		// step: validate the configuration
-		if err := config.isValid(); err != nil {
-			printUsage(err.Error())
-		}
-		// step: create the proxy
-		proxy, err := newKeycloakProxy(config)
-		if err != nil {
-			printUsage(err.Error())
-		}
-		// step: start the service
-		if err := proxy.Run(); err != nil {
-			printUsage(err.Error())
-		}
-		// step: setup the termination signals
-		signalChannel := make(chan os.Signal)
-		signal.Notify(signalChannel, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-
-		<-signalChannel
-	}
-	kc.Run(os.Args)
-}
-
-// printUsage display the command line usage and error
-func printUsage(message string) {
-	fmt.Fprintf(os.Stderr, "\n[error] %s\n", message)
-	os.Exit(1)
+	app := newOauthProxyApp()
+	app.Run(os.Args)
 }

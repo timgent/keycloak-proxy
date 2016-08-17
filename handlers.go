@@ -16,438 +16,58 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
+	"encoding/base64"
 	"fmt"
+	"io/ioutil"
+	"net"
 	"net/http"
+	"net/url"
 	"path"
-	"regexp"
-	"strings"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
-	"github.com/coreos/go-oidc/jose"
-	"github.com/coreos/go-oidc/oauth2"
-	"github.com/coreos/go-oidc/oidc"
 	"github.com/gin-gonic/gin"
-	"github.com/unrolled/secure"
 )
 
 //
-// The logic is broken into four handlers just to simplify the code
+// oauthAuthorizationHandler is responsible for performing the redirection to oauth provider
 //
-//  a) entryPointHandler checks if the the uri requires authentication
-//  b) authenticationHandler verifies the access token
-//  c) admissionHandler verifies that the token is authorized to access to uri resource
-//  c) proxyHandler is responsible for handling the reverse proxy to the upstream endpoint
-//
-
-const (
-	// cxEnforce is the tag name for a request requiring
-	cxEnforce = "Enforcing"
-)
-
-//
-// loggingHandler is a custom http logger
-//
-func (r *keycloakProxy) loggingHandler() gin.HandlerFunc {
-	return func(cx *gin.Context) {
-		start := time.Now()
-		cx.Next()
-		latency := time.Now().Sub(start)
-
-		log.WithFields(log.Fields{
-			"client_ip": cx.ClientIP(),
-			"method":    cx.Request.Method,
-			"status":    cx.Writer.Status(),
-			"bytes":     cx.Writer.Size(),
-			"path":      cx.Request.URL.Path,
-			"latency":   latency.String(),
-		}).Infof("[%d] |%s| |%10v| %-5s %s", cx.Writer.Status(), cx.ClientIP(), latency, cx.Request.Method, cx.Request.URL.Path)
-	}
-}
-
-//
-// securityHandler performs numerous security checks on the request
-//
-func (r *keycloakProxy) securityHandler() gin.HandlerFunc {
-	// step: create the security options
-	secure := secure.New(secure.Options{
-		AllowedHosts:         r.config.Hostnames,
-		BrowserXssFilter:     true,
-		ContentTypeNosniff:   true,
-		FrameDeny:            true,
-		STSIncludeSubdomains: true,
-		STSSeconds:           31536000,
-	})
-
-	return func(cx *gin.Context) {
-		// step: pass through the security middleware
-		if err := secure.Process(cx.Writer, cx.Request); err != nil {
-			log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed security middleware")
-			cx.Abort()
-			return
-		}
-		// step: permit the request to continue
-		cx.Next()
-	}
-}
-
-//
-// entryPointHandler checks to see if the request requires authentication
-//
-func (r *keycloakProxy) entryPointHandler() gin.HandlerFunc {
-	return func(cx *gin.Context) {
-		if strings.HasPrefix(cx.Request.URL.Path, oauthURL) {
-			cx.Next()
-			return
-		}
-
-		// step: check if authentication is required - gin doesn't support wildcard url, so we have have to use prefixes
-		for _, resource := range r.config.Resources {
-			if strings.HasPrefix(cx.Request.URL.Path, resource.URL) {
-				// step: has the resource been white listed?
-				if resource.WhiteListed {
-					break
-				}
-				// step: inject the resource into the context, saves us from doing this again
-				if containedIn(cx.Request.Method, resource.Methods) || containedIn("ANY", resource.Methods) {
-					cx.Set(cxEnforce, resource)
-				}
-				break
-			}
-		}
-		// step: pass into the authentication and admission handlers
-		cx.Next()
-
-		// step: add a custom headers to the request
-		for k, v := range r.config.Header {
-			cx.Request.Header.Set(k, v)
-		}
-
-		// step: check the request has not been aborted and if not, proxy request
-		if !cx.IsAborted() {
-			r.proxyHandler(cx)
-		}
-	}
-}
-
-//
-// authenticationHandler is responsible for verifying the access token
-//
-//  steps:
-//  - check if the request is protected and requires validation
-//  - retrieve the access token from the cookie or authorization header, if there isn't a token, check
-//    if there is a session state and use the refresh token to refresh access token
-//  - extract the user context from the access token, ensuring the minimum claims
-//  - validate the audience of the access token is directed to us
-//  - inject the user context into the request context for later layers
-//  - skip verification of the access token if enabled
-//  - else we validate the access token against the keypair via openid client
-//  - if everything is cool, move on, else thrown a redirect or forbidden
-//
-func (r *keycloakProxy) authenticationHandler() gin.HandlerFunc {
-	return func(cx *gin.Context) {
-		var session jose.JWT
-
-		// step: is authentication required on this uri?
-		if _, found := cx.Get(cxEnforce); !found {
-			log.Debugf("skipping the authentication handler, resource not protected")
-			cx.Next()
-
-			return
-		}
-
-		// step: retrieve the access token from the request
-		session, isBearer, err := r.getSessionToken(cx)
-		if err != nil {
-			// step: there isn't a session cookie, do we have refresh session cookie?
-			if err == ErrSessionNotFound && r.config.RefreshSessions && !isBearer {
-				session, err = r.refreshUserSessionToken(cx)
-				if err != nil {
-					log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed to refresh the access token")
-					r.redirectToAuthorization(cx)
-					return
-				}
-			} else {
-				log.Errorf("failed to get session, redirecting for authorization, %s", err)
-				r.redirectToAuthorization(cx)
-				return
-			}
-		}
-
-		// step: retrieve the identity and inject in the context
-		userContext, err := r.getUserContext(session)
-		if err != nil {
-			log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed to retrieve the identity from the token")
-			r.redirectToAuthorization(cx)
-			return
-		}
-		userContext.bearerToken = isBearer
-
-		log.Debugf("found user context: %s", userContext)
-
-		// step: check the audience for the token is us
-		if !userContext.isAudience(r.config.ClientID) {
-			log.WithFields(log.Fields{
-				"username":   userContext.name,
-				"expired_on": userContext.expiresAt.String(),
-				"issued":     userContext.audience,
-				"clientid":   r.config.ClientID,
-			}).Warnf("the access token audience is not us, redirecting back for authentication")
-
-			r.redirectToAuthorization(cx)
-			return
-		}
-
-		cx.Set(userContextName, userContext)
-
-		// step: verify the access token
-		if r.config.SkipTokenVerification {
-			log.Warnf("token verification enabled, skipping verification process - FOR TESTING ONLY")
-			if userContext.isExpired() {
-				log.WithFields(log.Fields{
-					"username":   userContext.name,
-					"expired_on": userContext.expiresAt.String(),
-				}).Errorf("the session has expired and verification switch off")
-
-				r.redirectToAuthorization(cx)
-			}
-
-			return
-		}
-
-		if err := r.verifyToken(userContext.token); err != nil {
-			fields := log.Fields{
-				"username":   userContext.name,
-				"expired_on": userContext.expiresAt.String(),
-				"error":      err.Error(),
-			}
-
-			// step: if the error post verification is anything other than a token expired error
-			// we immediately throw an access forbidden - as there is something messed up in the token
-			if err != ErrAccessTokenExpired {
-				log.WithFields(log.Fields{"error": err.Error()}).Errorf("access token has expired")
-				r.accessForbidden(cx)
-				return
-			}
-
-			if isBearer {
-				log.WithFields(fields).Errorf("the session has expired and we are using bearer token")
-				r.redirectToAuthorization(cx)
-				return
-			}
-
-			// step: are we refreshing the access tokens?
-			if !r.config.RefreshSessions {
-				log.WithFields(fields).Errorf("the session has expired and token refreshing is disabled")
-				r.redirectToAuthorization(cx)
-				return
-			}
-
-			// step: attempt to refresh the access token
-			if _, err := r.refreshUserSessionToken(cx); err != nil {
-				log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed to refresh the access token")
-				r.redirectToAuthorization(cx)
-				return
-			}
-		}
-
-		cx.Next()
-	}
-}
-
-//
-// admissionHandler is responsible checking the access token against the protected resource
-//
-// steps:
-//  - check if authentication and validation is required
-//  - if so, retrieve the resource and user from the request context
-//  - if we have any roles requirements validate the roles exists in the access token
-//  - if er have any claim requirements validate the claims are the same
-//  - if everything is ok, we permit the request to pass through
-//
-func (r *keycloakProxy) admissionHandler() gin.HandlerFunc {
-	// step: compile the regex's for the claims
-	claimMatches := make(map[string]*regexp.Regexp, 0)
-	for k, v := range r.config.ClaimsMatch {
-		claimMatches[k] = regexp.MustCompile(v)
-	}
-
-	return func(cx *gin.Context) {
-		// step: if authentication is required on this, grab the resource spec
-		ur, found := cx.Get(cxEnforce)
-		if !found {
-			return
-		}
-
-		// step: grab the identity from the context
-		uc, found := cx.Get(userContextName)
-		if !found {
-			panic("there is no identity in the request context")
-		}
-
-		resource := ur.(*Resource)
-		identity := uc.(*userContext)
-
-		// step: we need to check the roles
-		if roles := len(resource.Roles); roles > 0 {
-			if !hasRoles(resource.Roles, identity.roles) {
-				log.WithFields(log.Fields{
-					"access":   "denied",
-					"username": identity.name,
-					"resource": resource.URL,
-					"required": resource.getRoles(),
-				}).Warnf("access denied, invalid roles")
-
-				r.accessForbidden(cx)
-
-				return
-			}
-		}
-
-		// step: if we have any claim matching, validate the tokens has the claims
-		for claimName, match := range claimMatches {
-			// step: if the claim is NOT in the token, we access deny
-			value, found, err := identity.claims.StringClaim(claimName)
-			if err != nil {
-				log.WithFields(log.Fields{
-					"access":   "denied",
-					"username": identity.name,
-					"resource": resource.URL,
-					"error":    err.Error(),
-				}).Errorf("unable to extract the claim from token")
-
-				r.accessForbidden(cx)
-
-				return
-			}
-
-			if !found {
-				log.WithFields(log.Fields{
-					"access":   "denied",
-					"username": identity.name,
-					"resource": resource.URL,
-					"claim":    claimName,
-				}).Warnf("the token does not have the claim")
-
-				r.accessForbidden(cx)
-
-				return
-			}
-
-			// step: check the claim is the same
-			if !match.MatchString(value) {
-				log.WithFields(log.Fields{
-					"access":   "denied",
-					"username": identity.name,
-					"resource": resource.URL,
-					"claim":    claimName,
-					"issued":   value,
-					"required": match,
-				}).Warnf("the token claims does not match claim requirement")
-
-				r.accessForbidden(cx)
-
-				return
-			}
-		}
-
-		log.WithFields(log.Fields{
-			"access":   "permitted",
-			"username": identity.name,
-			"resource": resource.URL,
-			"expires":  identity.expiresAt.Sub(time.Now()).String(),
-			"bearer":   identity.bearerToken,
-		}).Debugf("resource access permitted: %s", cx.Request.RequestURI)
-	}
-}
-
-//
-// proxyHandler is responsible to proxy the requests on to the upstream endpoint
-//
-func (r *keycloakProxy) proxyHandler(cx *gin.Context) {
-	// step: double check, if enforce is true and no user context it's a internal error
-	if _, found := cx.Get(cxEnforce); found {
-		if _, found := cx.Get(userContextName); !found {
-			log.Errorf("no user context found for a secure request")
-			cx.AbortWithStatus(http.StatusInternalServerError)
-			return
-		}
-	}
-
-	// step: retrieve the user context if any
-	if identity, found := cx.Get(userContextName); found {
-		id := identity.(*userContext)
-		cx.Request.Header.Add("X-Auth-UserId", id.id)
-		cx.Request.Header.Add("X-Auth-Subject", id.preferredName)
-		cx.Request.Header.Add("X-Auth-Username", id.name)
-		cx.Request.Header.Add("X-Auth-Email", id.email)
-		cx.Request.Header.Add("X-Auth-ExpiresIn", id.expiresAt.String())
-		cx.Request.Header.Add("X-Auth-Token", id.token.Encode())
-		cx.Request.Header.Add("X-Auth-Roles", strings.Join(id.roles, ","))
-	}
-
-	// step: add the default headers
-	cx.Request.Header.Add("X-Forwarded-For", cx.Request.RemoteAddr)
-	cx.Request.Header.Set("X-Forwarded-Agent", prog)
-	cx.Request.Header.Set("X-Forwarded-Agent-Version", version)
-
-	// step: is this connection upgrading?
-	if isUpgradedConnection(cx.Request) {
-		log.Debugf("upgrading the connnection to %s", cx.Request.Header.Get(headerUpgrade))
-		if err := r.tryUpdateConnection(cx); err != nil {
-			log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed to upgrade the connection")
-
-			cx.AbortWithStatus(http.StatusInternalServerError)
-			return
-		}
-		cx.Abort()
-
-		return
-	}
-
-	r.proxy.ServeHTTP(cx.Writer, cx.Request)
-}
-
-// ---
-// The handlers for managing the OAuth authentication flow
-// ---
-
-//
-// oauthAuthorizationHandler is responsible for performing the redirection to keycloak service
-//
-func (r *keycloakProxy) oauthAuthorizationHandler(cx *gin.Context) {
-	// step: is token verification switched on?
+func (r *oauthProxy) oauthAuthorizationHandler(cx *gin.Context) {
+	// step: we can skip all of this if were not verifying the token
 	if r.config.SkipTokenVerification {
-		r.accessForbidden(cx)
+		cx.AbortWithStatus(http.StatusNotAcceptable)
 		return
 	}
 
-	// step: grab the oauth client
-	oac, err := r.openIDClient.OAuthClient()
+	client, err := r.client.OAuthClient()
 	if err != nil {
-		log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed to retrieve the oauth client")
-		cx.AbortWithStatus(http.StatusInternalServerError)
+		log.WithFields(log.Fields{
+			"error": err.Error(),
+		}).Errorf("failed to retrieve the oauth client for authorization")
 
+		cx.AbortWithStatus(http.StatusInternalServerError)
 		return
 	}
 
-	// step: set the grant type of the session
+	// step: set the access type of the session
 	accessType := ""
-	if r.config.RefreshSessions {
+	if containedIn("offline", r.config.Scopes) {
 		accessType = "offline"
 	}
 
-	log.WithFields(log.Fields{
-		"client_ip":   cx.ClientIP(),
-		"access_type": accessType,
-	}).Infof("incoming authorization request from client address: %s", cx.ClientIP())
+	// step: generate the authorization url
+	redirectionURL := client.AuthCodeURL(cx.Query("state"), accessType, "")
 
-	// step: build the redirection url to the authentication server
-	redirectionURL := oac.AuthCodeURL(cx.Query("state"), accessType, "")
+	log.WithFields(log.Fields{
+		"client_ip":       cx.ClientIP(),
+		"access_type":     accessType,
+		"redirection-url": redirectionURL,
+	}).Debugf("incoming authorization request from client address: %s", cx.ClientIP())
 
 	// step: if we have a custom sign in page, lets display that
-	if r.config.hasSignInPage() {
-		// step: add the redirection url
+	if r.config.hasCustomSignInPage() {
+		// step: inject any custom tags into the context for the template
 		model := make(map[string]string, 0)
 		for k, v := range r.config.TagData {
 			model[k] = v
@@ -458,187 +78,372 @@ func (r *keycloakProxy) oauthAuthorizationHandler(cx *gin.Context) {
 		return
 	}
 
-	// step: get the redirection url
 	r.redirectToURL(redirectionURL, cx)
 }
 
 //
-// oauthCallbackHandler is responsible for handling the response from keycloak
+// oauthCallbackHandler is responsible for handling the response from oauth service
 //
-func (r *keycloakProxy) oauthCallbackHandler(cx *gin.Context) {
+func (r *oauthProxy) oauthCallbackHandler(cx *gin.Context) {
 	// step: is token verification switched on?
 	if r.config.SkipTokenVerification {
-		r.accessForbidden(cx)
+		cx.AbortWithStatus(http.StatusNotAcceptable)
 		return
 	}
-
-	// step: get the code and state
-	code := cx.Request.URL.Query().Get("code")
-	state := cx.Request.URL.Query().Get("state")
 
 	// step: ensure we have a authorization code to exchange
+	code := cx.Request.URL.Query().Get("code")
 	if code == "" {
-		log.WithFields(log.Fields{"client_ip": cx.ClientIP()}).Error("code parameter missing in callback")
-
-		r.accessForbidden(cx)
+		cx.AbortWithStatus(http.StatusBadRequest)
 		return
-	}
-
-	// step: ensure we have a state or default to root /
-	if state == "" {
-		state = "/"
 	}
 
 	// step: exchange the authorization for a access token
-	response, err := r.getToken(oauth2.GrantTypeAuthCode, code)
+	response, err := exchangeAuthenticationCode(r.client, code)
 	if err != nil {
-		log.WithFields(log.Fields{"error": err.Error()}).Errorf("unable to exchange code for access token")
+		log.WithFields(log.Fields{
+			"error": err.Error(),
+		}).Errorf("unable to exchange code for access token")
+
 		r.accessForbidden(cx)
 		return
 	}
 
 	// step: parse decode the identity token
-	token, identity, err := r.parseToken(response.IDToken)
+	session, identity, err := parseToken(response.IDToken)
 	if err != nil {
-		log.WithFields(log.Fields{"error": err.Error()}).Errorf("unable to parse id token for identity")
-		r.accessForbidden(cx)
-		return
-	}
-	// step: verify the token is valid
-	if err := r.verifyToken(token); err != nil {
-		log.WithFields(log.Fields{"error": err.Error()}).Errorf("unable to verify the id token")
+		log.WithFields(log.Fields{
+			"error": err.Error(),
+		}).Errorf("unable to parse id token for identity")
+
 		r.accessForbidden(cx)
 		return
 	}
 
-	// step: attempt to decode the access token?
-	ac, id, err := r.parseToken(response.AccessToken)
+	// step: verify the token is valid
+	if err = verifyToken(r.client, session); err != nil {
+		log.WithFields(log.Fields{
+			"error": err.Error(),
+		}).Errorf("unable to verify the id token")
+
+		r.accessForbidden(cx)
+		return
+	}
+
+	// step: attempt to decode the access token else we default to the id token
+	accessToken, id, err := parseToken(response.AccessToken)
 	if err != nil {
-		log.WithFields(log.Fields{"error": err.Error()}).Errorf("unable to parse the access token, using id token only")
+		log.WithFields(log.Fields{
+			"error": err.Error(),
+		}).Errorf("unable to parse the access token, using id token only")
 	} else {
-		token = ac
+		session = accessToken
 		identity = id
 	}
 
 	log.WithFields(log.Fields{
-		"email":   identity.Email,
-		"expires": identity.ExpiresAt,
-	}).Infof("issuing a user session")
+		"email":    identity.Email,
+		"expires":  identity.ExpiresAt.Format(time.RFC3339),
+		"duration": identity.ExpiresAt.Sub(time.Now()).String(),
+	}).Infof("issuing a new access token for user, email: %s", identity.Email)
 
-	// step: create a session from the access token
-	if err := r.createSession(token, identity.ExpiresAt, cx); err != nil {
-		log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed to inject the session token")
-		cx.AbortWithStatus(http.StatusInternalServerError)
+	// step: drop's a session cookie with the access token
+	duration := identity.ExpiresAt.Sub(time.Now())
+	r.dropAccessTokenCookie(cx, session.Encode(), duration)
 
-		return
-	}
-
-	// step: are we using refresh tokens?
-	if r.config.RefreshSessions {
-		// step: create the state session
-		state := &sessionState{
-			refreshToken: response.RefreshToken,
-			expireOn:     time.Now().Add(r.config.MaxSession),
-		}
-
-		// step: can we parse and extract the refresh token from the response
-		// - note, the refresh token can be custom, i.e. doesn't have to be a jwt i.e. google for example
-		_, refreshToken, err := r.parseToken(response.RefreshToken)
+	// step: does the response has a refresh token and we are NOT ignore refresh tokens?
+	if r.config.EnableRefreshTokens && response.RefreshToken != "" {
+		// step: encrypt the refresh token
+		encrypted, err := encodeText(response.RefreshToken, r.config.EncryptionKey)
 		if err != nil {
 			log.WithFields(log.Fields{
 				"error": err.Error(),
-			}).Errorf("unable to parse refresh token (unknown format) using the as a static string")
-		} else {
-			// step: set the expiration of the refresh token.
-			// - first we check if the duration exceeds the expiration of the refresh token
-			if state.expireOn.After(refreshToken.ExpiresAt) {
-				log.WithFields(log.Fields{
-					"email":       refreshToken.Email,
-					"max_session": r.config.MaxSession.String(),
-					"duration":    state.expireOn.Format(time.RFC1123),
-					"refresh":     refreshToken.ExpiresAt.Format(time.RFC1123),
-				}).Errorf("max session exceeds the expiration of the refresh token, defaulting to refresh token")
-				state.expireOn = refreshToken.ExpiresAt
-			}
-		}
-		// step: create and inject the state session
-		if err := r.createSessionState(state, cx); err != nil {
-			log.WithFields(log.Fields{"error": err.Error()}).Errorf("failed to inject the session state into request")
+			}).Errorf("failed to encrypt the refresh token")
 
 			cx.AbortWithStatus(http.StatusInternalServerError)
 			return
 		}
 
-		// step: some debugging is useful here
-		log.WithFields(log.Fields{
-			"email":      identity.Email,
-			"client_ip":  cx.ClientIP(),
-			"expires_in": state.expireOn.Sub(time.Now()).String(),
-		}).Infof("successfully retrieve refresh token for client: %s", identity.Email)
+		// step: create and inject the state session
+		switch r.useStore() {
+		case true:
+			if err := r.StoreRefreshToken(session, encrypted); err != nil {
+				log.WithFields(log.Fields{
+					"error": err.Error(),
+				}).Warnf("failed to save the refresh token in the store")
+			}
+		default:
+			//
+			// step: attempt to decode the refresh token (not all refresh tokens are jwt tokens;
+			// gooogle for instance.
+			//
+			if _, ident, err := parseToken(response.RefreshToken); err != nil {
+				r.dropRefreshTokenCookie(cx, encrypted, time.Duration(72)*time.Hour)
+			} else {
+				r.dropRefreshTokenCookie(cx, encrypted, ident.ExpiresAt.Sub(time.Now()))
+			}
+		}
+	}
+
+	// step: decode the state variable
+	state := "/"
+	if cx.Request.URL.Query().Get("state") != "" {
+		decoded, err := base64.StdEncoding.DecodeString(cx.Request.URL.Query().Get("state"))
+		if err != nil {
+			log.WithFields(log.Fields{
+				"state": cx.Request.URL.Query().Get("state"),
+				"error": err.Error(),
+			}).Warnf("unable to decode the state parameter")
+		} else {
+			state = string(decoded)
+		}
 	}
 
 	r.redirectToURL(state, cx)
 }
 
 //
-// expirationHandler checks if the token has expired
+// loginHandler provide's a generic endpoint for clients to perform a user_credentials login to the provider
 //
-func (r *keycloakProxy) expirationHandler(cx *gin.Context) {
-	// step: get the access token from the request
-	token, err := r.getSession(cx)
+func (r *oauthProxy) loginHandler(cx *gin.Context) {
+	// step: parse the client credentials
+	username := cx.Request.PostFormValue("username")
+	password := cx.Request.PostFormValue("password")
+
+	if username == "" || password == "" {
+		log.WithFields(log.Fields{
+			"client_ip": cx.ClientIP(),
+		}).Errorf("request does not have both username and password")
+
+		cx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	// step: get the client
+	client, err := r.client.OAuthClient()
 	if err != nil {
-		if err == ErrSessionNotFound {
-			cx.AbortWithError(http.StatusUnauthorized, err)
+		log.WithFields(log.Fields{
+			"client_ip": cx.ClientIP(),
+			"error":     err.Error(),
+		}).Errorf("unable to create the oauth client for user_credentials request")
+
+		cx.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+
+	// step: request the access token via
+	token, err := client.UserCredsToken(username, password)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"client_ip": cx.ClientIP(),
+			"error":     err.Error(),
+		}).Errorf("unable to request the access token via grant_type 'password'")
+
+		cx.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+
+	// step: parse the token
+	_, identity, err := parseToken(token.AccessToken)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"client_ip": cx.ClientIP(),
+			"error":     err.Error(),
+		}).Errorf("unable to decode the access token")
+
+		cx.AbortWithStatus(http.StatusNotImplemented)
+		return
+	}
+
+	r.dropAccessTokenCookie(cx, token.AccessToken, identity.ExpiresAt.Sub(time.Now()))
+
+	cx.JSON(http.StatusOK, tokenResponse{
+		IDToken:      token.IDToken,
+		AccessToken:  token.AccessToken,
+		RefreshToken: token.RefreshToken,
+		ExpiresIn:    token.Expires,
+		Scope:        token.Scope,
+	})
+}
+
+//
+// logoutHandler performs a logout
+//  - if it's just a access token, the cookie is deleted
+//  - if the user has a refresh token, the token is invalidated by the provider
+//  - optionally, the user can be redirected by to a url
+//
+func (r *oauthProxy) logoutHandler(cx *gin.Context) {
+	// the user can specify a url to redirect the back to
+	redirectURL := cx.Request.URL.Query().Get("redirect")
+
+	// step: drop the access token
+	user, err := r.getIdentity(cx)
+	if err != nil {
+		cx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	// step: can either use the id token or the refresh token
+	identityToken := user.token.Encode()
+	if refresh, err := r.retrieveRefreshToken(cx, user); err == nil {
+		identityToken = refresh
+	}
+	r.clearAllCookies(cx)
+
+	// step: check if the user has a state session and if so, revoke it
+	if r.useStore() {
+		go func() {
+			if err := r.DeleteRefreshToken(user.token); err != nil {
+				log.WithFields(log.Fields{
+					"error": err.Error(),
+				}).Errorf("unable to remove the refresh token from store")
+			}
+		}()
+	}
+
+	// step: do we have a revocation endpoint?
+	if r.config.RevocationEndpoint != "" {
+		client, err := r.client.OAuthClient()
+		if err != nil {
+			log.WithFields(log.Fields{
+				"error": err.Error(),
+			}).Errorf("unable to retrieve the openid client")
+
+			cx.AbortWithStatus(http.StatusInternalServerError)
 			return
 		}
-		cx.AbortWithError(http.StatusInternalServerError, err)
+
+		// step: add the authentication headers
+		// @TODO need to add the authenticated request to go-oidc
+		encodedID := url.QueryEscape(r.config.ClientID)
+		encodedSecret := url.QueryEscape(r.config.ClientSecret)
+
+		// step: construct the url for revocation
+		request, err := http.NewRequest("POST", r.config.RevocationEndpoint,
+			bytes.NewBufferString(fmt.Sprintf("refresh_token=%s", identityToken)))
+		if err != nil {
+			log.WithFields(log.Fields{
+				"error": err.Error(),
+			}).Errorf("unable to construct the revocation request")
+
+			cx.AbortWithStatus(http.StatusInternalServerError)
+			return
+		}
+
+		// step: add the authentication headers and content-type
+		request.SetBasicAuth(encodedID, encodedSecret)
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+		// step: attempt to make the
+		response, err := client.HttpClient().Do(request)
+		if err != nil {
+			log.WithFields(log.Fields{
+				"error": err.Error(),
+			}).Errorf("unable to post to revocation endpoint")
+
+			return
+		}
+
+		// step: add a log for debugging
+		switch response.StatusCode {
+		case http.StatusNoContent:
+			log.WithFields(log.Fields{
+				"user": user.email,
+			}).Infof("successfully logged out of the endpoint")
+		default:
+			content, _ := ioutil.ReadAll(response.Body)
+			log.WithFields(log.Fields{
+				"status":   response.StatusCode,
+				"response": fmt.Sprintf("%s", content),
+			}).Errorf("invalid response from revocation endpoint")
+		}
+	}
+
+	// step: should we redirect the user
+	if redirectURL != "" {
+		r.redirectToURL(redirectURL, cx)
 		return
 	}
 
-	// step: decode the claims from the tokens
-	claims, err := token.Claims()
+	cx.AbortWithStatus(http.StatusOK)
+}
+
+//
+// expirationHandler checks if the token has expired
+//
+func (r *oauthProxy) expirationHandler(cx *gin.Context) {
+	// step: get the access token from the request
+	user, err := r.getIdentity(cx)
 	if err != nil {
-		cx.AbortWithError(http.StatusInternalServerError, fmt.Errorf("unable to extract the claims"))
+		cx.AbortWithError(http.StatusUnauthorized, err)
 		return
 	}
-	// step: extract the identity
-	identity, err := oidc.IdentityFromClaims(claims)
-	if err != nil {
-		cx.AbortWithError(http.StatusInternalServerError, fmt.Errorf("unable to extract identity"))
+	// step: check the access is not expired
+	if user.isExpired() {
+		cx.AbortWithError(http.StatusUnauthorized, err)
 		return
 	}
 
-	// step: check if token expired
-	if time.Now().After(identity.ExpiresAt) {
-		cx.AbortWithStatus(http.StatusForbidden)
-	} else {
-		cx.AbortWithStatus(http.StatusOK)
-	}
+	cx.AbortWithStatus(http.StatusOK)
 }
 
 //
 // tokenHandler display access token to screen
 //
-func (r *keycloakProxy) tokenHandler(cx *gin.Context) {
+func (r *oauthProxy) tokenHandler(cx *gin.Context) {
 	// step: extract the access token from the request
-	token, err := r.getSession(cx)
+	user, err := r.getIdentity(cx)
 	if err != nil {
-		if err == ErrSessionNotFound {
-			cx.AbortWithError(http.StatusOK, err)
-			return
-		}
-		cx.AbortWithError(http.StatusInternalServerError, fmt.Errorf("unable to retrieve session, error: %s", err))
+		cx.AbortWithError(http.StatusBadRequest, fmt.Errorf("unable to retrieve session, error: %s", err))
 		return
 	}
 
 	// step: write the json content
 	cx.Writer.Header().Set("Content-Type", "application/json")
-	cx.String(http.StatusOK, fmt.Sprintf("%s", token.Payload))
+	cx.String(http.StatusOK, fmt.Sprintf("%s", user.token.Payload))
 }
 
 //
 // healthHandler is a health check handler for the service
 //
-func (r *keycloakProxy) healthHandler(cx *gin.Context) {
-	cx.String(http.StatusOK, "OK")
+func (r *oauthProxy) healthHandler(cx *gin.Context) {
+	cx.Writer.Header().Set(versionHeader, version)
+	cx.String(http.StatusOK, "OK\n")
+}
+
+//
+// metricsHandler forwards the request into the prometheus handler
+//
+func (r *oauthProxy) metricsHandler(cx *gin.Context) {
+	if r.config.LocalhostMetrics {
+		if !net.ParseIP(cx.ClientIP()).IsLoopback() {
+			r.accessForbidden(cx)
+			return
+		}
+	}
+
+	r.prometheusHandler.ServeHTTP(cx.Writer, cx.Request)
+}
+
+//
+// retrieveRefreshToken retrieves the refresh token from store or cookie
+//
+func (r *oauthProxy) retrieveRefreshToken(cx *gin.Context, user *userContext) (string, error) {
+	var token string
+	var err error
+
+	// step: get the refresh token from the store or cookie
+	switch r.useStore() {
+	case true:
+		token, err = r.GetRefreshToken(user.token)
+	default:
+		token, err = r.getRefreshTokenFromCookie(cx)
+	}
+
+	// step: decode the cookie
+	if err != nil {
+		return token, err
+	}
+
+	return decodeText(token, r.config.EncryptionKey)
 }

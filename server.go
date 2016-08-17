@@ -22,136 +22,407 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
-	"path"
+	"os"
+	"runtime"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/coreos/go-oidc/oidc"
-
 	log "github.com/Sirupsen/logrus"
+	"github.com/armon/go-proxyproto"
+	"github.com/coreos/go-oidc/oidc"
+	"github.com/elazarl/goproxy"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
+	httplog "log"
 )
 
-// keycloakProxy is the server component
-type keycloakProxy struct {
+type oauthProxy struct {
+	// the proxy configuration
 	config *Config
 	// the gin service
-	router *gin.Engine
-	// the oidc provider config
-	openIDConfig oidc.ClientConfig
-	// the oidc client
-	openIDClient *oidc.Client
+	router http.Handler
+	// the opened client
+	client *oidc.Client
+	// the openid provider configuration
+	provider oidc.ProviderConfig
 	// the proxy client
-	proxy reverseProxy
-	// the upstream endpoint
-	upstreamURL *url.URL
-}
-
-type reverseProxy interface {
-	ServeHTTP(rw http.ResponseWriter, req *http.Request)
+	upstream reverseProxy
+	// the upstream endpoint url
+	endpoint *url.URL
+	// the store interface
+	store storage
+	// the prometheus handler
+	prometheusHandler http.Handler
 }
 
 func init() {
 	// step: ensure all time is in UTC
 	time.LoadLocation("UTC")
+	// step: set the core
+	runtime.GOMAXPROCS(runtime.NumCPU())
 }
 
-// newKeycloakProxy create's a new keycloak proxy from configuration
-func newKeycloakProxy(cfg *Config) (*keycloakProxy, error) {
+//
+// newProxy create's a new proxy from configuration
+//
+func newProxy(config *Config) (*oauthProxy, error) {
+	var err error
+	// step: set the logger
+	httplog.SetOutput(ioutil.Discard)
+
 	// step: set the logging level
-	if cfg.LogJSONFormat {
+	if config.LogJSONFormat {
 		log.SetFormatter(&log.JSONFormatter{})
 	}
-	if cfg.Verbose {
+	// step: set the logging level
+	gin.SetMode(gin.ReleaseMode)
+	if config.Verbose {
 		log.SetLevel(log.DebugLevel)
+		gin.SetMode(gin.DebugMode)
+		httplog.SetOutput(os.Stderr)
 	}
 
-	log.Infof("starting %s, version: %s, author: %s", prog, version, author)
+	log.Infof("starting %s, author: %s, version: %s, ", prog, author, version)
+
+	service := &oauthProxy{
+		config:            config,
+		prometheusHandler: prometheus.Handler(),
+	}
 
 	// step: parse the upstream endpoint
-	upstreamURL, err := url.Parse(cfg.Upstream)
-	if err != nil {
+	if service.endpoint, err = url.Parse(config.Upstream); err != nil {
 		return nil, err
 	}
 
-	// step: create a proxy service
-	service := &keycloakProxy{
-		config:      cfg,
-		upstreamURL: upstreamURL,
-	}
-
-	// step: initialize the reverse http proxy
-	reverse, err := service.initializeReverseProxy(upstreamURL)
-	if err != nil {
-		return nil, err
-	}
-	service.proxy = reverse
-
-	// step: initialize the openid client
-	if cfg.SkipTokenVerification {
-		log.Infof("TESTING ONLY CONFIG - the verification of the token have been disabled")
-
-	} else {
-		client, clientCfg, err := initializeOpenID(cfg.DiscoveryURL, cfg.ClientID, cfg.Secret, cfg.RedirectionURL, cfg.Scopes)
-		if err != nil {
+	// step: initialize the store if any
+	if config.StoreURL != "" {
+		if service.store, err = createStorage(config.StoreURL); err != nil {
 			return nil, err
 		}
-		service.openIDConfig = clientCfg
-		service.openIDClient = client
 	}
 
-	// step: initialize the gin router
-	router := gin.New()
-	service.router = router
-
-	// step: load the templates
-	service.initializeTemplates()
-	for _, resource := range cfg.Resources {
-		log.Infof("protecting resources under uri: %s", resource)
-	}
-	for name, value := range cfg.ClaimsMatch {
-		log.Infof("the token must container the claim: %s, required: %s", name, value)
+	// step: initialize the openid client
+	if !config.SkipTokenVerification {
+		if service.client, service.provider, err = createOpenIDClient(config); err != nil {
+			return nil, err
+		}
+	} else {
+		log.Warnf("TESTING ONLY CONFIG - the verification of the token have been disabled")
 	}
 
-	service.initializeRouter()
+	if config.ClientID == "" && config.ClientSecret == "" {
+		log.Warnf("Note: client credentials are not set, depending on provider (confidential|public) you might be unable to auth")
+	}
+
+	// step: are we running in forwarding more?
+	switch config.EnableForwarding {
+	case true:
+		if err := service.createForwardingProxy(); err != nil {
+			return nil, err
+		}
+	default:
+		if err := service.createReverseProxy(); err != nil {
+			return nil, err
+		}
+	}
 
 	return service, nil
 }
 
-// initializeRouter sets up the gin routing
-func (r keycloakProxy) initializeRouter() {
-	r.router.Use(gin.Recovery())
+//
+// createReverseProxy creates a reverse proxy
+//
+func (r *oauthProxy) createReverseProxy() error {
+	log.Infof("enabled reverse proxy mode, upstream url: %s", r.config.Upstream)
+
+	// step: display the protected resources
+	for _, resource := range r.config.Resources {
+		log.Infof("protecting resources under uri: %s", resource)
+	}
+	for name, value := range r.config.MatchClaims {
+		log.Infof("the token must container the claim: %s, required: %s", name, value)
+	}
+
+	// step: initialize the reverse http proxy
+	if err := r.createUpstreamProxy(r.endpoint); err != nil {
+		return err
+	}
+
+	//step: create the gin router
+	engine := gin.New()
+	engine.Use(gin.Recovery())
+
 	// step: are we logging the traffic?
 	if r.config.LogRequests {
-		r.router.Use(r.loggingHandler())
+		engine.Use(r.loggingMiddleware())
 	}
+
+	// step: enabling the metrics?
+	if r.config.EnableMetrics {
+		engine.Use(r.metricsMiddleware())
+	}
+
 	// step: enabling the security filter?
 	if r.config.EnableSecurityFilter {
-		log.Infof("enabling the security handler")
-		r.router.Use(r.securityHandler())
+		engine.Use(r.securityMiddleware())
 	}
 
 	// step: add the routing
-	r.router.GET(authorizationURL, r.oauthAuthorizationHandler)
-	r.router.GET(callbackURL, r.oauthCallbackHandler)
-	r.router.GET(healthURL, r.healthHandler)
-	r.router.GET(tokenURL, r.tokenHandler)
-	r.router.GET(expiredURL, r.expirationHandler)
+	oauth := engine.Group(oauthURL).Use(r.corsMiddleware(r.config.CrossOrigin))
+	oauth.GET(authorizationURL, r.oauthAuthorizationHandler)
+	oauth.GET(callbackURL, r.oauthCallbackHandler)
+	oauth.GET(healthURL, r.healthHandler)
+	oauth.GET(tokenURL, r.tokenHandler)
+	oauth.GET(expiredURL, r.expirationHandler)
+	oauth.GET(logoutURL, r.logoutHandler)
+	oauth.POST(loginURL, r.loginHandler)
+	// step: enable the metric page?
+	if r.config.EnableMetrics {
+		oauth.GET(metricsURL, r.metricsHandler)
+	}
 
-	r.router.Use(r.entryPointHandler(), r.authenticationHandler(), r.admissionHandler())
+	// step: add the middleware
+	engine.Use(r.entrypointMiddleware(), r.authenticationMiddleware(), r.admissionMiddleware(),
+		r.headersMiddleware(r.config.AddClaims), r.reverseProxyMiddleware())
+
+	// step: set the handler
+	r.router = engine
+
+	// step: load the templates
+	if err := r.createTemplates(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
-// initializeTemplates loads the custom template
-func (r *keycloakProxy) initializeTemplates() {
+//
+// createForwardingProxy creates a forwarding proxy
+//
+func (r *oauthProxy) createForwardingProxy() error {
+	log.Infof("enabling forward signing mode, listening on %s", r.config.Listen)
+
+	if r.config.SkipUpstreamTLSVerify {
+		log.Warnf("TLS verification switched off. In forward signing mode it's recommended you verify! (--skip-upstream-tls-verify=false)")
+	}
+
+	// step: initialize the reverse http proxy
+	if err := r.createUpstreamProxy(nil); err != nil {
+		return err
+	}
+
+	// step: setup and initialize the handler
+	forwardingHandler := r.forwardProxyHandler()
+
+	// step: set the http handler
+	proxy := r.upstream.(*goproxy.ProxyHttpServer)
+	r.router = proxy
+
+	// step: setup the tls configuration
+	if r.config.TLSCaCertificate != "" && r.config.TLSCaPrivateKey != "" {
+		// step: read in the ca
+		ca, err := loadCA(r.config.TLSCaCertificate, r.config.TLSCaPrivateKey)
+		if err != nil {
+			return fmt.Errorf("unable to load certificate authority, error: %s", err)
+		}
+		// step: implement the goproxy connect method
+		proxy.OnRequest().HandleConnectFunc(
+			func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+				return &goproxy.ConnectAction{
+					Action:    goproxy.ConnectMitm,
+					TLSConfig: goproxy.TLSConfigFromCA(ca),
+				}, host
+			},
+		)
+	} else {
+		// step: use the default certificate provided by goproxy
+		proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	}
+
+	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		// @NOTES, somewhat annoying but goproxy hands back a nil response on proxy client
+		// errors
+		if resp != nil && r.config.LogRequests {
+			start := ctx.UserData.(time.Time)
+			latency := time.Now().Sub(start)
+
+			log.WithFields(log.Fields{
+				"method":  resp.Request.Method,
+				"status":  resp.StatusCode,
+				"bytes":   resp.ContentLength,
+				"host":    resp.Request.Host,
+				"path":    resp.Request.URL.Path,
+				"latency": latency.String(),
+			}).Infof("[%d] |%s| |%10v| %-5s %s", resp.StatusCode, resp.Request.Host, latency, resp.Request.Method, resp.Request.URL.Path)
+		}
+
+		return resp
+	})
+	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		ctx.UserData = time.Now()
+		// step: forward into the handler
+		forwardingHandler(req, ctx.Resp)
+
+		return req, ctx.Resp
+	})
+
+	return nil
+}
+
+//
+// Run starts the proxy service
+//
+func (r *oauthProxy) Run() (err error) {
+	tlsConfig := &tls.Config{}
+
+	// step: are we doing mutual tls?
+	if r.config.TLSCaCertificate != "" {
+		log.Infof("enabling mutual tls, reading in the signing ca: %s", r.config.TLSCaCertificate)
+		caCert, err := ioutil.ReadFile(r.config.TLSCaCertificate)
+		if err != nil {
+			return err
+		}
+
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
+		tlsConfig.ClientCAs = caCertPool
+		tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+
+	server := &http.Server{
+		Addr:    r.config.Listen,
+		Handler: r.router,
+	}
+
+	// step: create the listener
+	var listener net.Listener
+	switch strings.HasPrefix(r.config.Listen, "unix://") {
+	case true:
+		socket := strings.Trim(r.config.Listen, "unix://")
+		// step: delete the socket if it exists
+		if exists := fileExists(socket); exists {
+			if err := os.Remove(socket); err != nil {
+				return err
+			}
+		}
+
+		log.Infof("listening on unix socket: %s", r.config.Listen)
+		if listener, err = net.Listen("unix", socket); err != nil {
+			return err
+		}
+
+	default:
+		listener, err = net.Listen("tcp", r.config.Listen)
+		if err != nil {
+			return err
+		}
+	}
+
+	// step: configure tls
+	if r.config.TLSCertificate != "" && r.config.TLSPrivateKey != "" {
+		server.TLSConfig = tlsConfig
+		if tlsConfig.NextProtos == nil {
+			tlsConfig.NextProtos = []string{"http/1.1"}
+		}
+		if len(tlsConfig.Certificates) == 0 || r.config.TLSCertificate != "" || r.config.TLSPrivateKey != "" {
+			tlsConfig.Certificates = make([]tls.Certificate, 1)
+			if tlsConfig.Certificates[0], err = tls.LoadX509KeyPair(r.config.TLSCertificate, r.config.TLSPrivateKey); err != nil {
+				return err
+			}
+		}
+		log.Infof("tls enabled, certificate: %s, key: %s", r.config.TLSCertificate, r.config.TLSPrivateKey)
+
+		listener = tls.NewListener(listener, tlsConfig)
+	}
+
+	// step: wrap the listen in a proxy protocol
+	if r.config.EnableProxyProtocol {
+		log.Infof("enabling the proxy protocol on listener: %s", r.config.Listen)
+		listener = &proxyproto.Listener{listener}
+	}
+
+	go func() {
+		log.Infof("keycloak proxy service starting on %s", r.config.Listen)
+		if err = server.Serve(listener); err != nil {
+			log.WithFields(log.Fields{
+				"error": err.Error(),
+			}).Fatalf("failed to start the service")
+		}
+	}()
+
+	return nil
+}
+
+//
+// createUpstreamProxy create a reverse http proxy from the upstream
+//
+func (r *oauthProxy) createUpstreamProxy(upstream *url.URL) error {
+	// step: create the default dialer
+	dialer := (&net.Dialer{
+		KeepAlive: r.config.UpstreamKeepaliveTimeout,
+		Timeout:   r.config.UpstreamTimeout,
+	}).Dial
+
+	// step: are we using a unix socket?
+	if upstream != nil && upstream.Scheme == "unix" {
+		log.Infof("using the unix domain socket: %s%s for upstream", upstream.Host, upstream.Path)
+		socketPath := fmt.Sprintf("%s%s", upstream.Host, upstream.Path)
+		dialer = func(network, address string) (net.Conn, error) {
+			return net.Dial("unix", socketPath)
+		}
+		upstream.Path = ""
+		upstream.Host = "domain-sock"
+		upstream.Scheme = "http"
+	}
+
+	// step: create the upstream tls configure
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: r.config.SkipUpstreamTLSVerify,
+	}
+
+	// step: are we using a client certificate
+	// @TODO provide a means of reload on the client certificate when it expires. I'm not sure if it's just a
+	// case of update the http transport settings - Also we to place this go-routine?
+	if r.config.TLSClientCertificate != "" {
+		cert, err := ioutil.ReadFile(r.config.TLSClientCertificate)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pool := x509.NewCertPool()
+		pool.AppendCertsFromPEM(cert)
+
+		// step: update the upstream tls to use the client certificate
+		tlsConfig.ClientCAs = pool
+		tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+
+	// step: create the forwarding proxy
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.Logger = httplog.New(ioutil.Discard, "", 0)
+	r.upstream = proxy
+
+	// step: update the tls configuration of the reverse proxy
+	r.upstream.(*goproxy.ProxyHttpServer).Tr = &http.Transport{
+		Dial:              dialer,
+		TLSClientConfig:   tlsConfig,
+		DisableKeepAlives: !r.config.UpstreamKeepalives,
+	}
+
+	return nil
+}
+
+//
+// createTemplates loads the custom template
+//
+func (r *oauthProxy) createTemplates() error {
 	var list []string
 
 	if r.config.SignInPage != "" {
 		log.Debugf("loading the custom sign in page: %s", r.config.SignInPage)
 		list = append(list, r.config.SignInPage)
 	}
+
 	if r.config.ForbiddenPage != "" {
 		log.Debugf("loading the custom sign forbidden page: %s", r.config.ForbiddenPage)
 		list = append(list, r.config.ForbiddenPage)
@@ -159,177 +430,8 @@ func (r *keycloakProxy) initializeTemplates() {
 
 	if len(list) > 0 {
 		log.Infof("loading the custom templates: %s", strings.Join(list, ","))
-		r.router.LoadHTMLFiles(list...)
+		r.router.(*gin.Engine).LoadHTMLFiles(list...)
 	}
-}
-
-// Run starts the proxy service
-func (r *keycloakProxy) Run() error {
-	tlsConfig := &tls.Config{}
-
-	// step: are we doing mutual tls?
-	if r.config.TLSCaCertificate != "" {
-		log.Infof("enabling mutual tls, reading in the ca: %s", r.config.TLSCaCertificate)
-
-		caCert, err := ioutil.ReadFile(r.config.TLSCaCertificate)
-		if err != nil {
-			return err
-		}
-		caCertPool := x509.NewCertPool()
-		caCertPool.AppendCertsFromPEM(caCert)
-
-		tlsConfig.ClientCAs = caCertPool
-		tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-	}
-
-	go func() {
-		log.Infof("keycloak proxy service starting on %s", r.config.Listen)
-
-		var err error
-		if r.config.TLSCertificate == "" {
-			err = r.router.Run(r.config.Listen)
-		} else {
-			server := &http.Server{
-				Addr:      r.config.Listen,
-				Handler:   r.router,
-				TLSConfig: tlsConfig,
-			}
-			err = server.ListenAndServeTLS(r.config.TLSCertificate, r.config.TLSPrivateKey)
-		}
-		if err != nil {
-			log.WithFields(log.Fields{"error": err.Error()}).Fatalf("failed to start the service")
-		}
-	}()
 
 	return nil
-}
-
-// redirectToURL redirects the user and aborts the context
-func (r keycloakProxy) redirectToURL(url string, cx *gin.Context) {
-	// step: add the cors headers
-	r.injectCORSHeaders(cx)
-
-	cx.Redirect(http.StatusTemporaryRedirect, url)
-	cx.Abort()
-}
-
-// accessForbidden redirects the user to the forbidden page
-func (r keycloakProxy) accessForbidden(cx *gin.Context) {
-	// step: do we have a custom forbidden page
-	if r.config.hasForbiddenPage() {
-		cx.HTML(http.StatusForbidden, path.Base(r.config.ForbiddenPage), r.config.TagData)
-		cx.Abort()
-		return
-	}
-
-	cx.AbortWithStatus(http.StatusForbidden)
-}
-
-// redirectToAuthorization redirects the user to authorization handler
-func (r keycloakProxy) redirectToAuthorization(cx *gin.Context) {
-	// step: are we handling redirects?
-	if r.config.NoRedirects {
-		cx.AbortWithStatus(http.StatusUnauthorized)
-		return
-	}
-
-	// step: add a state referrer to the authorization page
-	authQuery := fmt.Sprintf("?state=%s", cx.Request.URL.String())
-
-	// step: if verification is switched off, we can't authorization
-	if r.config.SkipTokenVerification {
-		log.Errorf("refusing to redirection to authorization endpoint, skip token verification switched on")
-		cx.AbortWithStatus(http.StatusForbidden)
-		return
-	}
-
-	r.redirectToURL(authorizationURL+authQuery, cx)
-}
-
-// injectCORSHeaders adds the cors access controls to the oauth responses
-func (r *keycloakProxy) injectCORSHeaders(cx *gin.Context) {
-	c := r.config.CORS
-	if len(c.Origins) > 0 {
-		cx.Writer.Header().Set("Access-Control-Allow-Origin", strings.Join(c.Origins, ","))
-	}
-	if len(c.Methods) > 0 {
-		cx.Writer.Header().Set("Access-Control-Allow-Methods", strings.Join(c.Methods, ","))
-	}
-	if len(c.Headers) > 0 {
-		cx.Writer.Header().Set("Access-Control-Allow-Headers", strings.Join(c.Headers, ","))
-	}
-	if len(c.ExposedHeaders) > 0 {
-		cx.Writer.Header().Set("Access-Control-Expose-Headers", strings.Join(c.ExposedHeaders, ","))
-	}
-	if c.Credentials {
-		cx.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-	}
-	if c.MaxAge > 0 {
-		cx.Writer.Header().Set("Access-Control-Max-Age", fmt.Sprintf("%d", int(c.MaxAge.Seconds())))
-	}
-}
-
-func (r *keycloakProxy) addAuthenticationHeader(cx *gin.Context, errorCode, errorMessage string) {
-	// step: inject the error message
-	header := "Bearer realm=\"secure\""
-	if errorCode != "" {
-		header += fmt.Sprintf(",error=\"%s\"", errorCode)
-	}
-	if errorMessage != "" {
-		header += fmt.Sprintf(", error_description=\"%s\"", errorMessage)
-	}
-
-	// step: add the www-authenticate header
-	cx.Writer.Header().Set("WWW-Authenticate", header)
-}
-
-// tryUpdateConnection attempt to upgrade the connection to a http pdy stream
-func (r *keycloakProxy) tryUpdateConnection(cx *gin.Context) error {
-	// step: dial the endpoint
-	tlsConn, err := tryDialEndpoint(r.upstreamURL)
-	if err != nil {
-		return err
-	}
-	defer tlsConn.Close()
-
-	// step: we need to hijack the underlining client connection
-	clientConn, _, err := cx.Writer.(http.Hijacker).Hijack()
-	if err != nil {
-		return err
-	}
-	defer clientConn.Close()
-
-	// step: write the request to upstream
-	if err = cx.Request.Write(tlsConn); err != nil {
-		return err
-	}
-
-	// step: copy the date between client and upstream endpoint
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go transferBytes(tlsConn, clientConn, &wg)
-	go transferBytes(clientConn, tlsConn, &wg)
-	wg.Wait()
-
-	return nil
-}
-
-// initializeReverseProxy create a reverse http proxy from the upstream
-func (r *keycloakProxy) initializeReverseProxy(upstream *url.URL) (reverseProxy, error) {
-	proxy := httputil.NewSingleHostReverseProxy(upstream)
-
-	// step: we don't care about the cert verification here
-	proxy.Transport = &http.Transport{
-		Dial: (&net.Dialer{
-			KeepAlive: 10 * time.Second,
-			Timeout:   10 * time.Second,
-		}).Dial,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: r.config.SkipUpstreamTLSVerify,
-		},
-		DisableKeepAlives:   !r.config.Keepalives,
-		TLSHandshakeTimeout: 10 * time.Second,
-	}
-
-	return proxy, nil
 }

@@ -16,13 +16,54 @@ limitations under the License.
 package main
 
 import (
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
-// isValid ensure the resource is valid
-func (r *Resource) isValid() error {
-	// step: ensure everything is initialized
+func newResource() *Resource {
+	return &Resource{}
+}
+
+//
+// parse decodes a resource definition
+//
+func (r *Resource) parse(resource string) (*Resource, error) {
+	if resource == "" {
+		return nil, errors.New("the resource has no options")
+	}
+
+	for _, x := range strings.Split(resource, "|") {
+		kp := strings.Split(x, "=")
+		if len(kp) != 2 {
+			return nil, errors.New("invalid resource keypair, should be (uri|roles|methods|white-listed)=comma_values")
+		}
+		switch kp[0] {
+		case "uri":
+			r.URL = kp[1]
+		case "methods":
+			r.Methods = strings.Split(kp[1], ",")
+		case "roles":
+			r.Roles = strings.Split(kp[1], ",")
+		case "white-listed":
+			value, err := strconv.ParseBool(kp[1])
+			if err != nil {
+				return nil, errors.New("the value of whitelisted must be true|TRUE|T or it's false equivilant")
+			}
+			r.WhiteListed = value
+		default:
+			return nil, errors.New("invalid identifier, should be roles, uri or methods")
+		}
+	}
+
+	return r, nil
+}
+
+//
+// valid ensure the resource is valid
+//
+func (r *Resource) valid() error {
 	if r.Methods == nil {
 		r.Methods = make([]string, 0)
 	}
@@ -31,12 +72,12 @@ func (r *Resource) isValid() error {
 	}
 
 	if strings.HasPrefix(r.URL, oauthURL) {
-		return fmt.Errorf("this is used by the oauth handlers")
+		return errors.New("this is used by the oauth handlers")
 	}
 
 	// step: check we have a url
 	if r.URL == "" {
-		return fmt.Errorf("resource does not have url")
+		return errors.New("resource does not have url")
 	}
 
 	// step: add any of no methods
@@ -46,7 +87,7 @@ func (r *Resource) isValid() error {
 
 	// step: check the method is valid
 	for _, m := range r.Methods {
-		if !isValidMethod(m) {
+		if !isValidHTTPMethod(m) {
 			return fmt.Errorf("invalid method %s", m)
 		}
 	}
